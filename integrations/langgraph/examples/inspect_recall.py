@@ -34,6 +34,7 @@ from powercontext.client import PowerContextClient
 from powercontext.http import RememberMemoryRequest
 
 SCOPE_ID = "project:langgraph-inspect-recall"
+SEED_TEXT = "Adopt hexagonal architecture for the payment gateway."
 
 
 def _build_graph():
@@ -52,7 +53,7 @@ async def main(base_url: str) -> None:
             RememberMemoryRequest(
                 scope_id=SCOPE_ID,
                 kind="decision",
-                text="Adopt hexagonal architecture for the payment gateway.",
+                text=SEED_TEXT,
                 reason="example seed",
             )
         )

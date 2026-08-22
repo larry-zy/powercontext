@@ -145,6 +145,7 @@ def test_inspect_recall_example_runs(capsys: pytest.CaptureFixture[str]) -> None
     sys.path.insert(0, str(EXAMPLES_DIR))
     try:
         example = importlib.import_module("inspect_recall")
+        seed_text = example.SEED_TEXT
         with example.local_powercontext_server() as base_url:
             asyncio.run(example.main(base_url))
     finally:
@@ -154,4 +155,4 @@ def test_inspect_recall_example_runs(capsys: pytest.CaptureFixture[str]) -> None
 
     printed = capsys.readouterr().out
     assert UNTRUSTED_LABEL in printed
-    assert MEMORY_TEXT in printed
+    assert seed_text in printed
