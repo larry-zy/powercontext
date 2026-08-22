@@ -2147,7 +2147,7 @@ provides-extras = ["builtin", "cli", "client", "server", "tracing-otlp"]
 [package.metadata.requires-dev]
 dev = [
     { name = "datamodel-code-generator", specifier = "==0.64.0" },
-    { name = "langchain-core" },
+    { name = "langchain-core", specifier = ">=1,<2" },
     { name = "langgraph", specifier = ">=1.2,<2" },
     { name = "mkdocstrings-python", specifier = ">=1.0.3" },
     { name = "powercontext", extras = ["cli", "server"] },
