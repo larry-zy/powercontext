@@ -29,7 +29,7 @@ import pytest
 pytest.importorskip("powercontext_langgraph")
 
 from powercontext_langgraph import MissingScopeError, resolve_scope_id
-from powercontext_langgraph._scope import normalize_git_remote
+from powercontext_langgraph.scope import normalize_git_remote
 
 from powercontext.limits import MAX_SCOPE_ID_LENGTH
 

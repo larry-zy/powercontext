@@ -43,7 +43,7 @@ from powercontext_langgraph import (
     powercontext_search,
     powercontext_tools,
 )
-from powercontext_langgraph._client import shared_http_client
+from powercontext_langgraph.client import shared_http_client
 
 SCOPE = "project:langgraph-tools-test"
 

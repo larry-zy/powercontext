@@ -29,8 +29,8 @@ from pydantic import BaseModel, Field
 from powercontext.client import ClientError
 from powercontext.http import PrepareContextRequest, RememberMemoryRequest, SearchMemoryRequest
 
-from ._client import open_client, resolve_config
-from ._runtime import current_scope
+from .client import open_client, resolve_config
+from .runtime import current_scope
 
 
 class _SearchInput(BaseModel):

@@ -23,7 +23,9 @@ token is sent as ``Authorization: Bearer`` without leaking into agent-visible me
 from __future__ import annotations
 
 import asyncio
+import importlib
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -47,6 +49,7 @@ SCOPE_ID = "project:langgraph-e2e"
 AUTH_TOKEN = "langgraph-e2e-token"  # noqa: S105 - non-secret test credential.
 MEMORY_TEXT = "Adopt hexagonal architecture for the payment gateway."
 UNTRUSTED_LABEL = "untrusted historical evidence"
+EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "integrations" / "langgraph" / "examples"
 
 
 async def _remember_node(state: MessagesState) -> dict[str, list[BaseMessage]]:
@@ -129,3 +132,26 @@ def _wait_until_started(server: uvicorn.Server, thread: threading.Thread) -> Non
     while thread.is_alive() and not server.started and time.monotonic() < deadline:
         time.sleep(0.01)
     assert server.started
+
+
+def test_inspect_recall_example_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    """Run the shipped key-free example end-to-end so it cannot rot as the adapter evolves.
+
+    The example is documentation, kept beside the library and excluded from the wheel, so it has no unit-test
+    home. Executing its own ``main`` against its own throwaway Server here guarantees the documented
+    write-then-recall path keeps working without duplicating the example's logic.
+    """
+
+    sys.path.insert(0, str(EXAMPLES_DIR))
+    try:
+        example = importlib.import_module("inspect_recall")
+        with example.local_powercontext_server() as base_url:
+            asyncio.run(example.main(base_url))
+    finally:
+        sys.path.remove(str(EXAMPLES_DIR))
+        sys.modules.pop("inspect_recall", None)
+        sys.modules.pop("_local_server", None)
+
+    printed = capsys.readouterr().out
+    assert UNTRUSTED_LABEL in printed
+    assert MEMORY_TEXT in printed

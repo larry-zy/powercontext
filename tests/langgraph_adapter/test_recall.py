@@ -40,7 +40,7 @@ from powercontext.server.settings import McpConfig, ServerSettings
 pytest.importorskip("powercontext_langgraph")
 
 from powercontext_langgraph import MissingScopeError, PowerContextRecall, PowerContextScope
-from powercontext_langgraph._client import shared_http_client
+from powercontext_langgraph.client import shared_http_client
 from powercontext_langgraph.recall import CONTEXT_MARKER
 
 UNTRUSTED_LABEL = "untrusted historical evidence"

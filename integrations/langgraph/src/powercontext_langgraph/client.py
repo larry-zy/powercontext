@@ -25,9 +25,8 @@ import httpx
 
 from powercontext.client import PowerContextClient
 
-from ._scope import resolve_scope_id
-from ._settings import PowerContextLangGraphSettings
-from .scope import PowerContextScope
+from .scope import PowerContextScope, resolve_scope_id
+from .settings import PowerContextLangGraphSettings
 
 # A shared HTTP client lets a long-running deployment reuse one connection pool across nodes and tools, and lets tests
 # route requests to an in-process ASGI app. When set, per-operation clients borrow it and never close it.

@@ -24,8 +24,8 @@ from langchain_core.messages import BaseMessage, SystemMessage
 from powercontext.client import ClientError, ServerResponseError
 from powercontext.http import PrepareContextRequest, PreparedContextStatus
 
-from ._client import open_client, resolve_config
-from ._runtime import current_scope
+from .client import open_client, resolve_config
+from .runtime import current_scope
 
 _LOGGER = logging.getLogger("powercontext.langgraph")
 
