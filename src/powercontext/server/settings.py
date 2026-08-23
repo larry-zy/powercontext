@@ -17,10 +17,32 @@ from powercontext.builtin.runtime.config import (
     normalize_database_discriminator,
 )
 from powercontext.paths import default_database_path, sqlite_url
+from powercontext.transport import is_loopback_host
+
+_UNSAFE_BIND_MESSAGE = (
+    "A non-loopback bind requires bearer authentication; "
+    "set allow_unauthenticated_non_loopback to opt in when TLS is "
+    "terminated upstream or the network is otherwise controlled"
+)
 
 
 def _default_database() -> SQLiteConfig:
     return SQLiteConfig(url=sqlite_url(default_database_path()))
+
+
+def is_unauthenticated_non_loopback_bind(
+    *,
+    host: str,
+    auth_enabled: bool,
+    allow_unauthenticated_non_loopback: bool,
+) -> bool:
+    """Return whether a bind exposes an unauthenticated Server off loopback."""
+
+    return (
+        not is_loopback_host(host)
+        and not auth_enabled
+        and not allow_unauthenticated_non_loopback
+    )
 
 
 class HttpConfig(BaseModel):
@@ -130,6 +152,7 @@ class ServerSettings(BaseSettings):
     http: HttpConfig = Field(default_factory=HttpConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
     auth: BearerAuthConfig = Field(default_factory=BearerAuthConfig)
+    allow_unauthenticated_non_loopback: bool = False
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     logging: ServerLoggingConfig = Field(default_factory=ServerLoggingConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
@@ -151,6 +174,16 @@ class ServerSettings(BaseSettings):
             raise ValueError("Dashboard requires Server bearer authentication")  # noqa: TRY003
         return self
 
+    @model_validator(mode="after")
+    def reject_unauthenticated_non_loopback_bind(self) -> ServerSettings:
+        if is_unauthenticated_non_loopback_bind(
+            host=self.http.host,
+            auth_enabled=self.auth.enabled,
+            allow_unauthenticated_non_loopback=self.allow_unauthenticated_non_loopback,
+        ):
+            raise ValueError(_UNSAFE_BIND_MESSAGE)
+        return self
+
 
 __all__ = [
     "BearerAuthConfig",
@@ -163,4 +196,5 @@ __all__ = [
     "ServerLoggingConfig",
     "ServerSettings",
     "TracingConfig",
+    "is_unauthenticated_non_loopback_bind",
 ]

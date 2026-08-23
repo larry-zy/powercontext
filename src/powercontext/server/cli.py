@@ -8,7 +8,11 @@ import typer
 
 from powercontext.server.factory import create_server_app
 from powercontext.server.logging import configure_server_logging
-from powercontext.server.settings import HttpConfig, ServerSettings
+from powercontext.server.settings import (
+    HttpConfig,
+    ServerSettings,
+    is_unauthenticated_non_loopback_bind,
+)
 from powercontext.server.tracing import configure_server_tracing
 
 HELP_OPTION_NAMES = ("-h", "--help")
@@ -39,6 +43,17 @@ def run(
         port=environment.http.port if port is None else port,
     )
     settings = environment.model_copy(update={"http": http})
+    if is_unauthenticated_non_loopback_bind(
+        host=settings.http.host,
+        auth_enabled=settings.auth.enabled,
+        allow_unauthenticated_non_loopback=settings.allow_unauthenticated_non_loopback,
+    ):
+        raise typer.BadParameter(  # noqa: TRY003
+            "refusing to bind an unauthenticated Server to a non-loopback address; "
+            "enable authentication, keep the bind on loopback, or set "
+            "POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true to opt in",
+            param_hint="--host",
+        )
     configure_server_logging(settings.logging)
     tracing = configure_server_tracing(settings.tracing)
     try:

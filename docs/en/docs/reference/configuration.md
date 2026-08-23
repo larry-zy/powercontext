@@ -35,6 +35,7 @@ Server settings use the `POWERCONTEXT_SERVER_` prefix.
 | `POWERCONTEXT_SERVER_MCP_PATH` | `/mcp` | MCP path |
 | `POWERCONTEXT_SERVER_AUTH_ENABLED` | `false` | Require one static bearer token for HTTP and MCP |
 | `POWERCONTEXT_SERVER_AUTH_TOKEN` | unset | Static bearer token; required when authentication is enabled |
+| `POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK` | `false` | Opt in to a non-loopback bind while authentication is disabled |
 | `POWERCONTEXT_SERVER_LOGGING_LEVEL` | `INFO` | Operational log level |
 | `POWERCONTEXT_SERVER_LOGGING_FORMAT` | `console` | `console` or structured `json` output |
 | `POWERCONTEXT_SERVER_LOGGING_ACCESS` | `true` | Log external HTTP and logical MCP request completion |
@@ -53,8 +54,14 @@ Server settings use the `POWERCONTEXT_SERVER_` prefix.
 | `POWERCONTEXT_SERVER_EXTERNAL_SKILLS` | unset | JSON object containing the host identity and explicit Codex Skill roots |
 
 Static bearer authentication is disabled by default. When enabled, API and MCP requests must include
-`Authorization: Bearer <token>`; the liveness and readiness endpoints remain public. Plain HTTP should remain on a
-loopback address. Use TLS before exposing an authenticated Server over a network.
+`Authorization: Bearer <token>`; the liveness and readiness endpoints remain public. Plain HTTP is trusted only on a
+loopback address (`127.0.0.1`, `localhost`, `::1`). The Server refuses to start when it binds to a non-loopback address
+while authentication is disabled; either enable authentication, keep the bind on loopback, or, when TLS is terminated
+upstream or the network is otherwise controlled, set `POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true` to
+opt in explicitly. Use TLS before exposing an authenticated Server over a network.
+
+The Python Client and CLI apply the matching rule for outbound requests: an unencrypted `http://` Server URL is accepted
+only for loopback hosts, and the Client refuses to send a bearer token over an unencrypted non-loopback connection.
 
 Example with a controlled SQLite path and scheduled extraction:
 

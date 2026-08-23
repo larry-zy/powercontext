@@ -144,6 +144,7 @@ from powercontext.http._generated.operations import (
     UPDATE_HANDOFF_REPORT_WORKSTREAM,
     Operation,
 )
+from powercontext.transport import is_plaintext_non_loopback
 
 REQUEST_ID_HEADER = "X-PowerContext-Request-ID"
 _RequestT = TypeVar("_RequestT")
@@ -162,6 +163,8 @@ class PowerContextClient:
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        if token and is_plaintext_non_loopback(self._base_url):
+            raise ValueError("refusing to send a bearer token over unencrypted non-loopback HTTP")  # noqa: TRY003
         self._headers = {"Authorization": f"Bearer {token}"} if token else None
         self._owned_http_client: httpx.AsyncClient | None = None
         if http_client is None:

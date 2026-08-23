@@ -5,6 +5,8 @@ from __future__ import annotations
 from pydantic import Field, HttpUrl, SecretStr, TypeAdapter, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from powercontext.transport import is_plaintext_non_loopback
+
 _HTTP_URL = TypeAdapter(HttpUrl)
 
 
@@ -32,6 +34,8 @@ class ClientSettings(BaseSettings):
             raise ValueError("PowerContext Server URL must not contain credentials")  # noqa: TRY003
         if parsed.query or parsed.fragment:
             raise ValueError("PowerContext Server URL must not contain a query or fragment")  # noqa: TRY003
+        if is_plaintext_non_loopback(normalized):
+            raise ValueError("Unencrypted PowerContext Server URLs must be loopback addresses")  # noqa: TRY003
         return normalized
 
 

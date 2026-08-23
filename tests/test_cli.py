@@ -198,6 +198,7 @@ def test_server_command_layers_partial_cli_overrides_over_environment_settings(
     monkeypatch.setattr("powercontext.server.cli._run_server", run_server)
     monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config: None)
     monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: tracing)
+    monkeypatch.setenv("POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK", "true")
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
 
@@ -211,6 +212,24 @@ def test_server_command_layers_partial_cli_overrides_over_environment_settings(
     assert run_server.call_args.kwargs["host"] == expected_host
     assert run_server.call_args.kwargs["port"] == expected_port
     tracing.shutdown.assert_called_once_with()
+
+
+def test_server_command_rejects_an_unauthenticated_non_loopback_host_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_server = Mock()
+    tracing = Mock()
+    monkeypatch.setattr("powercontext.server.cli._run_server", run_server)
+    monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config: None)
+    monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: tracing)
+
+    result = CliRunner().invoke(
+        create_cli([server_app]),
+        ["server", "run", "--host", "0.0.0.0"],  # noqa: S104 - exercises the non-loopback guard.
+    )
+
+    assert result.exit_code != 0
+    run_server.assert_not_called()
 
 
 def test_server_command_does_not_load_client_settings(monkeypatch: pytest.MonkeyPatch) -> None:
