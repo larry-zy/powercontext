@@ -89,7 +89,7 @@ class PowerContextRecall:
         ):
             self._configuration_error_logged = True
             _LOGGER.error(
-                "PowerContext rejected the request with HTTP %s; check POWERCONTEXT_LANGGRAPH_TOKEN.",
+                "PowerContext rejected the request with HTTP %s; check POWERCONTEXT_LANGGRAPH_TOKEN or PowerContextScope(token=...).",
                 exc.status_code,
             )
         else:

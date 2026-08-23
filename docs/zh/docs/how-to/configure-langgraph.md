@@ -60,7 +60,7 @@ graph.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"
 `PowerContextScope(base_url=..., token=..., timeout=...)` 可按单次运行覆盖这些值。scope 上留为 `None` 的字段会回退到
 环境值。
 
-`TOKEN` 承载的是**裸 token**，不是完整的 `Authorization` header 值。这与 Codex、Claude Code 和 DeepSeek Harness
+`POWERCONTEXT_LANGGRAPH_TOKEN` 承载的是**裸 token**，不是完整的 `Authorization` header 值。这与 Codex、Claude Code 和 DeepSeek Harness
 插件使用的 `POWERCONTEXT_*_AUTHORIZATION` 约定不同。`PowerContextClient` 接收裸 token 并在内部组装成
 `Authorization: Bearer <token>`。该 token 只用于对 Client 鉴权，绝不会出现在图状态或对 Agent 可见的消息内容里。
 

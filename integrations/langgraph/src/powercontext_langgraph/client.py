@@ -68,7 +68,8 @@ def open_client(config: ResolvedConfig) -> PowerContextClient:
     """Open an async client for one operation. The caller closes it with ``async with``.
 
     When a shared client is installed the operation borrows it; ``PowerContextClient.aclose`` then closes only the
-    per-operation client it created, which is none, so the shared client stays open.
+    per-operation client it created, which is none, so the shared client stays open. The borrowed client also keeps
+    its own timeout configuration, so ``config.timeout`` applies only when no shared client is installed.
     """
 
     shared = _SHARED_HTTP_CLIENT.get()
@@ -79,7 +80,11 @@ def open_client(config: ResolvedConfig) -> PowerContextClient:
 
 @contextmanager
 def shared_http_client(client: httpx.AsyncClient) -> Iterator[None]:
-    """Install a shared HTTP client for the duration of the block."""
+    """Install a shared HTTP client for the duration of the block.
+
+    Operations that borrow it use its timeout configuration, overriding the resolved
+    ``PowerContextScope(timeout=...)`` / ``POWERCONTEXT_LANGGRAPH_TIMEOUT`` value.
+    """
 
     token = _SHARED_HTTP_CLIENT.set(client)
     try:

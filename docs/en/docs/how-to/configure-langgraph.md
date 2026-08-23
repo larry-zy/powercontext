@@ -64,7 +64,7 @@ Configuration is read through pydantic-settings with the prefix `POWERCONTEXT_LA
 `PowerContextScope(base_url=..., token=..., timeout=...)` overrides these per run. A field left as `None` on the
 scope falls back to the environment value.
 
-`TOKEN` carries a **bare token**, not a complete `Authorization` header value. This differs from the
+`POWERCONTEXT_LANGGRAPH_TOKEN` carries a **bare token**, not a complete `Authorization` header value. This differs from the
 `POWERCONTEXT_*_AUTHORIZATION` convention used by the Codex, Claude Code, and DeepSeek Harness plugins.
 `PowerContextClient` accepts the bare token and composes `Authorization: Bearer <token>` internally. The token is
 used only to authenticate the Client; it never appears in graph state or agent-visible message content.
