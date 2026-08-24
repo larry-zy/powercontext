@@ -125,3 +125,33 @@ def test_tools_return_error_string_when_server_unreachable(monkeypatch: pytest.M
         assert result.startswith("(PowerContext unavailable:")
 
     asyncio.run(scenario())
+
+
+def test_context_tool_completes_for_over_limit_query(tmp_path: Path) -> None:
+    # A model can emit a query longer than the public 8192-char limit. The tool clamps it and still returns a
+    # result rather than raising a request-validation error.
+    app = _server_app(tmp_path)
+
+    async def scenario() -> None:
+        result = await powercontext_context.ainvoke({"query": "a" * 9000})
+        assert result == "(no relevant PowerContext context)"
+
+    _run(app, scenario)
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        (powercontext_search, {"query": ""}),  # query below the min length
+        (powercontext_context, {"query": "   "}),  # query is only whitespace, failing the non-blank pattern
+        (powercontext_remember, {"text": "note", "kind": "k" * 200}),  # kind above the max length
+    ],
+)
+def test_tools_reject_out_of_range_arguments_without_raising(tool, arguments) -> None:  # type: ignore[no-untyped-def]
+    # Request construction is inside the fail-open boundary: a model-supplied argument outside the public contract
+    # returns a tool result instead of raising and aborting the graph.
+    async def scenario() -> None:
+        result = await tool.ainvoke(arguments)
+        assert result.startswith("(PowerContext rejected the request:")
+
+    asyncio.run(scenario())

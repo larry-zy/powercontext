@@ -25,7 +25,7 @@ from pydantic import ValidationError
 from powercontext.client import ClientError, ServerResponseError
 from powercontext.http import PrepareContextRequest, PreparedContextStatus
 
-from .client import open_client, resolve_config
+from .client import ResolvedConfig, open_client, resolve_config
 from .runtime import current_scope
 
 _LOGGER = logging.getLogger("powercontext.langgraph")
@@ -87,10 +87,11 @@ class PowerContextRecall:
     async def _prepare_once(self, messages: list[BaseMessage], query: str) -> str | None:
         """Prepare context for the current human turn, reusing the result across the turn's model steps."""
 
-        key = _turn_key(messages, query)
+        config = resolve_config(current_scope())
+        key = _turn_key(config.scope_id, messages, query)
         if key is not None and key in self._turn_cache:
             return self._turn_cache[key]
-        content = await self._prepare(query)
+        content = await self._prepare(config, query)
         if key is not None:
             self._remember_turn(key, content)
         return content
@@ -101,8 +102,7 @@ class PowerContextRecall:
         while len(cache) > _TURN_CACHE_LIMIT:
             del cache[next(iter(cache))]
 
-    async def _prepare(self, query: str) -> str | None:
-        config = resolve_config(current_scope())
+    async def _prepare(self, config: ResolvedConfig, query: str) -> str | None:
         try:
             request = PrepareContextRequest(
                 scope_id=config.scope_id, query=query[:_MAX_QUERY_CHARS], max_bytes=config.max_bytes
@@ -149,12 +149,17 @@ def _latest_human_text(messages: list[BaseMessage]) -> str:
     return ""
 
 
-def _turn_key(messages: list[BaseMessage], query: str) -> str | None:
-    """Return a stable key for the current human turn, used to cache preparation across its model steps."""
+def _turn_key(scope_id: str, messages: list[BaseMessage], query: str) -> str | None:
+    """Return a stable key for the current human turn, used to cache preparation across its model steps.
+
+    The key is scoped by ``scope_id`` so that a single shared ``PowerContextRecall`` instance never serves one
+    tenant's prepared content to another run carrying a different scope but the same human text.
+    """
 
     for message in reversed(messages):
         if getattr(message, "type", None) != "human":
             continue
         identifier = getattr(message, "id", None)
-        return f"id:{identifier}" if identifier else f"text:{query}"
+        turn = f"id:{identifier}" if identifier else f"text:{query}"
+        return f"{scope_id}\x00{turn}"
     return None

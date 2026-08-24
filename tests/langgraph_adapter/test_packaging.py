@@ -37,15 +37,18 @@ def _build_wheel(out_dir: Path) -> Path:
     if uv is None:
         pytest.skip("uv is required to build the wheel")
     try:
-        subprocess.run(
+        result = subprocess.run(
             [uv, "build", "--wheel", "--out-dir", str(out_dir), str(_PROJECT)],
-            check=True,
             capture_output=True,
             text=True,
             timeout=300,
         )
-    except (OSError, subprocess.SubprocessError) as exc:  # offline build isolation, missing toolchain, etc.
-        pytest.skip(f"wheel build unavailable: {exc}")
+    except FileNotFoundError:  # uv disappeared between the which() probe and the call
+        pytest.skip("uv is required to build the wheel")
+    except subprocess.TimeoutExpired:  # a slow or offline build environment, not a packaging defect
+        pytest.skip("wheel build timed out")
+    # A non-zero exit is a real packaging defect (e.g. invalid license metadata) — fail rather than skip.
+    assert result.returncode == 0, f"uv build failed:\n{result.stdout}\n{result.stderr}"
     wheels = list(out_dir.glob("*.whl"))
     assert wheels, "no wheel was produced"
     return wheels[0]

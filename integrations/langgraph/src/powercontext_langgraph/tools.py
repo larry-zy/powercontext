@@ -24,13 +24,17 @@ from __future__ import annotations
 import json
 
 from langchain_core.tools import BaseTool, tool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from powercontext.client import ClientError
 from powercontext.http import PrepareContextRequest, RememberMemoryRequest, SearchMemoryRequest
 
 from .client import open_client, resolve_config
 from .runtime import current_scope
+
+# The public ``query`` contract caps a search or prepare request at this many characters. A model can emit more,
+# so the query is clamped before the request is built, keeping the tool best-effort rather than raising.
+_MAX_QUERY_CHARS = 8192
 
 
 class _SearchInput(BaseModel):
@@ -49,10 +53,12 @@ async def powercontext_search(query: str, limit: int = 5) -> str:
     """Search durable PowerContext memory for a question or topic."""
 
     config = resolve_config(current_scope())
-    request = SearchMemoryRequest(scope_id=config.scope_id, query=query, limit=limit)
     try:
+        request = SearchMemoryRequest(scope_id=config.scope_id, query=query[:_MAX_QUERY_CHARS], limit=limit)
         async with open_client(config) as client:
             response = await client.search_memory(request)
+    except ValidationError:
+        return _invalid_arguments()
     except ClientError as exc:
         return _error(exc)
     if not response.hits:
@@ -76,10 +82,12 @@ async def powercontext_remember(text: str, kind: str = "agent-note", reason: str
     """Save one explicit durable memory for later agent sessions."""
 
     config = resolve_config(current_scope())
-    request = RememberMemoryRequest(scope_id=config.scope_id, kind=kind, text=text, reason=reason)
     try:
+        request = RememberMemoryRequest(scope_id=config.scope_id, kind=kind, text=text, reason=reason)
         async with open_client(config) as client:
             response = await client.remember_memory(request)
+    except ValidationError:
+        return _invalid_arguments()
     except ClientError as exc:
         return _error(exc)
     if response.entry is None:
@@ -92,10 +100,14 @@ async def powercontext_context(query: str) -> str:
     """Prepare a bounded PowerContext payload for a new question."""
 
     config = resolve_config(current_scope())
-    request = PrepareContextRequest(scope_id=config.scope_id, query=query, max_bytes=config.max_bytes)
     try:
+        request = PrepareContextRequest(
+            scope_id=config.scope_id, query=query[:_MAX_QUERY_CHARS], max_bytes=config.max_bytes
+        )
         async with open_client(config) as client:
             response = await client.prepare_context(request)
+    except ValidationError:
+        return _invalid_arguments()
     except ClientError as exc:
         return _error(exc)
     return response.content or "(no relevant PowerContext context)"
@@ -109,3 +121,9 @@ def powercontext_tools() -> list[BaseTool]:
 
 def _error(exc: ClientError) -> str:
     return f"(PowerContext unavailable: {type(exc).__name__})"
+
+
+def _invalid_arguments() -> str:
+    # A model-supplied argument fell outside the public request contract (e.g. an empty or over-length field).
+    # Report it as a tool result so the model can retry with corrected arguments rather than aborting the graph.
+    return "(PowerContext rejected the request: an argument was empty or out of range)"
