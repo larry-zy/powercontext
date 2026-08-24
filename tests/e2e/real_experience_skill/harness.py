@@ -283,6 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901 - one exceptio
     arguments = _arguments(argv)
     configured_settings: ServerSettings | None = None
     configured_scopes: ConfiguredScopes | None = None
+    external_skill: Path | None = None
     if arguments.configured:
         load_dotenv(arguments.env_file, override=False)
         configured_settings = ServerSettings()
@@ -379,7 +380,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901 - one exceptio
                 )
             )
         else:
-            if configured_scopes is None or configured_server_settings is None:
+            if configured_scopes is None or configured_server_settings is None or external_skill is None:
                 _fail("configured E2E state was not initialized")
             journey = asyncio.run(
                 _run_configured_journey(
@@ -472,7 +473,7 @@ async def _run_journey(
     codex_environment: Mapping[str, str],
     repositories: Mapping[str, Path],
     server_url: str,
-    timeout: int,
+    timeout: int,  # noqa: ASYNC109 - external Codex process budget, not an asyncio timeout scope
 ) -> None:
     scope_id = f"real-codex-experience-skill:{int(time.time())}"
     producer_schema = recorder.write_json("schemas/experience.json", PRODUCER_SCHEMA)
@@ -751,7 +752,7 @@ async def _run_configured_journey(
     external_skill: Path,
     scopes: ConfiguredScopes,
     server_url: str,
-    timeout: int,
+    timeout: int,  # noqa: ASYNC109 - external Codex process budget, not an asyncio timeout scope
     generation_timeout: float,
 ) -> ConfiguredJourneyState:
     memory_scope = scopes.memory
@@ -2012,12 +2013,6 @@ def _validate_configured_settings(settings: ServerSettings) -> None:
         _fail("configured E2E requires POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL")
     if inference.embedding_model is None:
         _fail("configured E2E requires POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL")
-    if isinstance(settings.database, SQLiteConfig):
-        extension = settings.database.vec1_extension
-        if extension is None or not extension.is_file():
-            _fail("configured SQLite E2E requires an installed Vec1 extension file")
-        if not hasattr(sqlite3.Connection, "enable_load_extension"):
-            _fail("configured SQLite E2E requires a Python build with SQLite extension loading enabled")
 
 
 def _new_configured_scopes() -> ConfiguredScopes:
@@ -2288,7 +2283,7 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--configured",
         action="store_true",
-        help="Use real generation, embedding, database, Vec1, and External Skill settings from the environment.",
+        help="Use real generation, embedding, database, and External Skill settings from the environment.",
     )
     parser.add_argument(
         "--env-file",

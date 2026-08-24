@@ -14,8 +14,10 @@
 
 import asyncio
 import logging
+import os
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -55,7 +57,7 @@ class _FailingEmbeddingModel:
         model="test:embedding",
         dimension=3,
         distance="l2",
-        normalization="none",
+        normalization="unit",
     )
 
     def __init__(self, error: Exception) -> None:
@@ -131,14 +133,22 @@ def test_settings_load_server_environment(monkeypatch) -> None:
     assert settings.external_skills.codex_roots[0].path.as_posix() == "/srv/project/.agents/skills"
 
 
-def test_server_settings_vec1_preserves_file_database(tmp_path, monkeypatch) -> None:
-    data_dir = tmp_path / "powercontext-data"
-    monkeypatch.setenv("POWERCONTEXT_HOME", str(data_dir))
-    monkeypatch.setenv("POWERCONTEXT_SERVER_DATABASE_VEC1_EXTENSION", str(tmp_path / "vec1"))
+def test_env_example_loads_server_settings(monkeypatch) -> None:
+    for name in tuple(os.environ):
+        if name.startswith("POWERCONTEXT_SERVER_"):
+            monkeypatch.delenv(name)
+
+    for line in Path(".env.example").read_text(encoding="utf-8").splitlines():
+        assignment = line.strip()
+        if not assignment or assignment.startswith("#"):
+            continue
+        name, value = assignment.split("=", maxsplit=1)
+        monkeypatch.setenv(name, value)
 
     settings = ServerSettings()
 
-    assert settings.database.url == f"sqlite+aiosqlite:///{data_dir / 'powercontext.db'}"
+    assert isinstance(settings.database, SQLiteConfig)
+    assert settings.inference.embedding_dimension == 2560
 
 
 def test_server_settings_select_oceanbase(monkeypatch) -> None:
@@ -556,6 +566,55 @@ def test_prepare_context_rejects_memory_specific_tuning_fields(tmp_path) -> None
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_prepare_context_rejects_unicode_surrogates_without_crashing(tmp_path) -> None:
+    app = create_server_app(
+        settings=ServerSettings(
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}"),
+            mcp=McpConfig(enabled=False),
+        )
+    )
+
+    body = '{"scope_id":"project:test","query":"\\udcaa"}'.encode(
+        "utf-8",
+        "surrogatepass",
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/context/prepare",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert "input" not in error["details"]["errors"][0]
+
+
+def test_prepare_context_rejects_invalid_request_without_input_field(tmp_path) -> None:
+    app = create_server_app(
+        settings=ServerSettings(
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}"),
+            mcp=McpConfig(enabled=False),
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/context/prepare",
+            json={
+                "scope_id": "project:test",
+                "query": "query",
+                "candidate_limit": 2,
+            },
+        )
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert "input" not in error["details"]["errors"][0]
 
 
 def test_stats_returns_inclusive_utc_periods_for_empty_scope(tmp_path) -> None:
