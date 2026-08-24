@@ -18,6 +18,10 @@ A compiled graph writes a memory through the ``powercontext_remember`` tool and 
 ``PowerContextRecall``, both over a live uvicorn server. The connection is carried entirely by the run scope
 (``context_schema``), which proves the tool and node pick up the scope from the graph runtime and that the bare
 token is sent as ``Authorization: Bearer`` without leaking into agent-visible message content.
+
+The custom graph mirrors ``create_react_agent``: ``PowerContextRecall`` writes the model input onto an
+``llm_input_messages`` channel that the model step reads, so the recalled context reaches the model without ever
+entering the persisted ``messages`` history.
 """
 
 from __future__ import annotations
@@ -29,12 +33,15 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Annotated
 
 import pytest
 import uvicorn
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 from pydantic import SecretStr
+from typing_extensions import TypedDict
 
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import InferenceConfig
@@ -52,21 +59,34 @@ UNTRUSTED_LABEL = "untrusted historical evidence"
 EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "integrations" / "langgraph" / "examples"
 
 
-async def _remember_node(state: MessagesState) -> dict[str, list[BaseMessage]]:
+class ChainState(TypedDict):
+    """State for the custom chain.
+
+    ``messages`` is the persisted history; ``llm_input_messages`` is the ephemeral, last-value model input that
+    ``PowerContextRecall`` writes and the model step reads, exactly as ``create_react_agent`` wires it.
+    """
+
+    messages: Annotated[list[BaseMessage], add_messages]
+    llm_input_messages: list[BaseMessage]
+
+
+async def _remember_node(state: ChainState) -> dict[str, list[BaseMessage]]:
     # The tool resolves its scope and connection from the graph runtime, so no client is threaded through state.
     saved = await powercontext_remember.ainvoke({"text": MEMORY_TEXT, "kind": "decision", "reason": "e2e seed"})
     return {"messages": [AIMessage(content=saved)]}
 
 
-def _echo_node(state: MessagesState) -> dict[str, list[BaseMessage]]:
-    return {"messages": [AIMessage(content="acknowledged")]}
+def _build_graph(model_inputs: list[list[BaseMessage]]):
+    def _model_node(state: ChainState) -> dict[str, list[BaseMessage]]:
+        # The model reads the recall-supplied input, never the raw persisted history.
+        model_input = state.get("llm_input_messages") or state["messages"]
+        model_inputs.append(list(model_input))
+        return {"messages": [AIMessage(content="acknowledged")]}
 
-
-def _build_graph():
-    builder = StateGraph(MessagesState, context_schema=PowerContextScope)
+    builder = StateGraph(ChainState, context_schema=PowerContextScope)
     builder.add_node("remember", _remember_node)
     builder.add_node("recall", PowerContextRecall())
-    builder.add_node("model", _echo_node)
+    builder.add_node("model", _model_node)
     builder.add_edge(START, "remember")
     builder.add_edge("remember", "recall")
     builder.add_edge("recall", "model")
@@ -97,7 +117,8 @@ def test_langgraph_write_then_recall_over_real_http(tmp_path: Path, authenticati
     thread.start()
     try:
         _wait_until_started(server, thread)
-        graph = _build_graph()
+        model_inputs: list[list[BaseMessage]] = []
+        graph = _build_graph(model_inputs)
         scope = PowerContextScope(
             scope_id=SCOPE_ID,
             base_url=base_url,
@@ -111,14 +132,21 @@ def test_langgraph_write_then_recall_over_real_http(tmp_path: Path, authenticati
             )
         )
 
-        messages = result["messages"]
-        system_texts = [message.text for message in messages if message.type == "system"]
+        # The recalled memory reaches the model as a single leading untrusted system message.
+        assert model_inputs, "the model step ran"
+        model_input = model_inputs[-1]
+        system_texts = [message.text for message in model_input if message.type == "system"]
         assert len(system_texts) == 1
+        assert model_input[0].type == "system"
         assert UNTRUSTED_LABEL in system_texts[0]
         assert MEMORY_TEXT in system_texts[0]
 
+        # The recall context is ephemeral: it never enters the persisted history.
+        messages = result["messages"]
+        assert [message.text for message in messages if message.type == "system"] == []
+
         # The bare token authenticates the write and read, but must never surface in agent-visible message content.
-        for message in messages:
+        for message in [*messages, *model_input]:
             assert AUTH_TOKEN not in message.text
     finally:
         server.should_exit = True

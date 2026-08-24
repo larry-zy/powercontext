@@ -5,21 +5,52 @@ Server through the public Python client. It integrates at the node and tool leve
 are stable public API, and provides three components:
 
 - `powercontext_tools()` returns `langchain_core.tools.BaseTool` instances for model-initiated Memory read and write.
-- `PowerContextRecall` is a callable usable as a graph node or as a `pre_model_hook`, preparing bounded context
-  before a model step.
+- `PowerContextRecall` is a `pre_model_hook` that prepares bounded context before a model step. It supplies a
+  complete, ordered model input on the `llm_input_messages` channel, so the recalled context reaches the model
+  without ever entering the persisted `messages` history.
 - `PowerContextScope` is a dataclass intended for the graph `context_schema`, carrying the durable scope for a run.
 
 ## Minimal usage
 
+Use `PowerContextRecall` as the `pre_model_hook` of `create_react_agent`, which wires the `llm_input_messages`
+channel for you:
+
 ```python
-from langgraph.graph import StateGraph, START
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import create_react_agent
 from powercontext_langgraph import PowerContextRecall, PowerContextScope, powercontext_tools
+
+agent = create_react_agent(
+    model,
+    tools=powercontext_tools(),
+    pre_model_hook=PowerContextRecall(),
+    context_schema=PowerContextScope,
+    checkpointer=my_checkpointer,
+)
+agent.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
+```
+
+In a custom graph, add an `llm_input_messages` channel to the state and have the model step read it, exactly as
+`create_react_agent` does:
+
+```python
+from typing import Annotated
+from typing_extensions import TypedDict
+from langchain_core.messages import BaseMessage
+from langgraph.graph import StateGraph, START
+from langgraph.graph.message import add_messages
+from powercontext_langgraph import PowerContextRecall, PowerContextScope
+
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    llm_input_messages: list[BaseMessage]
+
+def call_model(state: AgentState):
+    model_input = state.get("llm_input_messages") or state["messages"]
+    ...
 
 builder = StateGraph(AgentState, context_schema=PowerContextScope)
 builder.add_node("recall", PowerContextRecall())
 builder.add_node("model", call_model)
-builder.add_node("tools", ToolNode([*my_tools, *powercontext_tools()]))
 builder.add_edge(START, "recall")
 builder.add_edge("recall", "model")
 
@@ -29,10 +60,17 @@ graph.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"
 
 ## Installation
 
+This package is not yet published to PyPI, so install it from source alongside a running Server:
+
 ```bash
-uv pip install powercontext-langgraph
+uv pip install "powercontext-langgraph @ git+https://github.com/oceanbase/powercontext.git#subdirectory=integrations/langgraph"
 powercontext server run
 ```
+
+From a checkout of this repository you can instead install the local path, e.g.
+`uv pip install ./integrations/langgraph`. Publishing to PyPI is pending a standalone build and release step for the
+package (its version must be advanced independently of the root `powercontext` distribution); until that lands, use
+the source install above.
 
 ## Configuration
 

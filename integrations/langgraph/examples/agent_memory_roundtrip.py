@@ -15,9 +15,11 @@
 """Drive a real agent through the write-then-recall memory loop against a live PowerContext Server.
 
 Turn 1 asks the agent to persist a decision, which it does by calling the ``powercontext_remember`` tool.
-Turn 2 is a fresh question; ``PowerContextRecall`` injects the remembered decision as an untrusted-history
-system message before the model step, and the agent answers from it. The connection uses bearer auth, and
-the example checks that the token never reaches the agent-visible messages.
+Turn 2 is a fresh question; ``PowerContextRecall`` supplies the remembered decision as an untrusted-history
+system message on the ephemeral ``llm_input_messages`` channel before the model step, and the agent answers
+from it. Because that context never enters the persisted history, the example verifies recall through the
+agent's answer rather than by inspecting messages. The connection uses bearer auth, and the example checks
+that the token never reaches the agent-visible messages.
 
 The model is any OpenAI-compatible endpoint; the defaults target DeepSeek. Requires ``langchain-openai``
 and an API key::
@@ -100,14 +102,13 @@ async def main(base_url: str) -> int:
     _print_turn("turn 2 — recall via PowerContextRecall", turn2["messages"])
 
     all_messages = turn1["messages"] + turn2["messages"]
-    system_texts = [m.text for m in turn2["messages"] if getattr(m, "type", None) == "system"]
     answers = [m.text for m in turn2["messages"] if getattr(m, "type", None) == "ai" and (m.text or "").strip()]
     checks = {
-        "recall injected an untrusted-history system message": any(
-            "untrusted historical evidence" in text for text in system_texts
+        # Recall is ephemeral, so it is observed through the agent's answer rather than in the persisted history.
+        "final answer used the recalled fact": bool(answers) and "hexagonal" in answers[-1].lower(),
+        "recall context stayed out of the persisted history": all(
+            getattr(m, "type", None) != "system" for m in all_messages
         ),
-        "recall carried the remembered fact": any("hexagonal" in text.lower() for text in system_texts),
-        "final answer used the fact": bool(answers) and "hexagonal" in answers[-1].lower(),
         "auth token never leaked into messages": all(AUTH_TOKEN not in (m.text or "") for m in all_messages),
     }
     print("\n===== checks =====")

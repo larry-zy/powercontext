@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Print the exact system message ``PowerContextRecall`` injects. No model or API key required.
+"""Print the exact system message ``PowerContextRecall`` supplies. No model or API key required.
 
 The example remembers one decision, then runs a one-node graph whose only node is ``PowerContextRecall``.
-It prints the injected system message so you can see the untrusted-history framing and the citations the
-Server attaches. Run it with::
+``PowerContextRecall`` writes the model input onto the ephemeral ``llm_input_messages`` channel, so the state
+carries that channel and the example prints the leading system message from it, showing the untrusted-history
+framing and the citations the Server attaches. Run it with::
 
     uv run python integrations/langgraph/examples/inspect_recall.py
 """
@@ -24,11 +25,14 @@ Server attaches. Run it with::
 from __future__ import annotations
 
 import asyncio
+from typing import Annotated
 
 from _local_server import local_powercontext_server
-from langchain_core.messages import HumanMessage
-from langgraph.graph import END, START, MessagesState, StateGraph
+from langchain_core.messages import BaseMessage, HumanMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 from powercontext_langgraph import PowerContextRecall, PowerContextScope
+from typing_extensions import TypedDict
 
 from powercontext.client import PowerContextClient
 from powercontext.http import RememberMemoryRequest
@@ -37,8 +41,13 @@ SCOPE_ID = "project:langgraph-inspect-recall"
 SEED_TEXT = "Adopt hexagonal architecture for the payment gateway."
 
 
+class RecallState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    llm_input_messages: list[BaseMessage]
+
+
 def _build_graph():
-    builder = StateGraph(MessagesState, context_schema=PowerContextScope)
+    builder = StateGraph(RecallState, context_schema=PowerContextScope)
     builder.add_node("recall", PowerContextRecall())
     builder.add_edge(START, "recall")
     builder.add_edge("recall", END)
@@ -64,11 +73,12 @@ async def main(base_url: str) -> None:
         context=scope,
     )
 
-    system_messages = [message for message in result["messages"] if getattr(message, "type", None) == "system"]
+    model_input = result.get("llm_input_messages") or []
+    system_messages = [message for message in model_input if getattr(message, "type", None) == "system"]
     if not system_messages:
-        print("Recall injected nothing — the Server returned no relevant context.")
+        print("Recall supplied nothing — the Server returned no relevant context.")
         return
-    print("---- injected system message ----")
+    print("---- supplied system message ----")
     print(system_messages[0].text)
     print("---- end ----")
 

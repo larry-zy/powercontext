@@ -11,10 +11,16 @@ primitives that are stable public API. It never starts or embeds the Server.
 
 ## Install
 
+The package is not yet published to PyPI, so install it from source alongside a running Server:
+
 ```bash
-uv pip install powercontext-langgraph
+uv pip install "powercontext-langgraph @ git+https://github.com/oceanbase/powercontext.git#subdirectory=integrations/langgraph"
 powercontext server run
 ```
+
+From a checkout you can install the local path instead: `uv pip install ./integrations/langgraph`. Publishing to
+PyPI is pending a standalone build and release step that advances the package version independently of the root
+`powercontext` distribution; until that lands, use the source install above.
 
 The package depends on `powercontext[client]`, `langgraph`, `langchain-core`, and `pydantic-settings`. It does not
 pull in the Server; point it at a Server you run separately.
@@ -24,20 +30,50 @@ pull in the Server; point it at a Server you run separately.
 - `powercontext_tools()` returns `langchain_core.tools.BaseTool` instances — `powercontext_search`,
   `powercontext_remember`, and `powercontext_context` — for model-initiated Memory read and write. Add them to a
   `ToolNode` or any tool list.
-- `PowerContextRecall` is a callable usable as a graph node or as a `pre_model_hook`. It reads the latest human
-  message, requests one bounded `PreparedContext`, and prepends the result as a system message before the model step.
+- `PowerContextRecall` is a `pre_model_hook`. It reads the latest human message, requests one bounded
+  `PreparedContext`, and supplies a complete, ordered model input on the `llm_input_messages` channel — the prepared
+  content as a single leading system message, followed by the run's messages. That context reaches the model but
+  never enters the persisted `messages` history, so it cannot accumulate across turns under a checkpointer.
 - `PowerContextScope` is a dataclass intended for the graph `context_schema`. It carries the durable scope, and
   optional per-run connection overrides, for one run.
 
+Use it as the `pre_model_hook` of `create_react_agent`, which wires the `llm_input_messages` channel for you:
+
 ```python
-from langgraph.graph import StateGraph, START
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import create_react_agent
 from powercontext_langgraph import PowerContextRecall, PowerContextScope, powercontext_tools
+
+agent = create_react_agent(
+    model,
+    tools=powercontext_tools(),
+    pre_model_hook=PowerContextRecall(),
+    context_schema=PowerContextScope,
+    checkpointer=my_checkpointer,
+)
+agent.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
+```
+
+In a custom graph, add an `llm_input_messages` channel to the state and have the model step read it:
+
+```python
+from typing import Annotated
+from typing_extensions import TypedDict
+from langchain_core.messages import BaseMessage
+from langgraph.graph import StateGraph, START
+from langgraph.graph.message import add_messages
+from powercontext_langgraph import PowerContextRecall, PowerContextScope
+
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    llm_input_messages: list[BaseMessage]
+
+def call_model(state: AgentState):
+    model_input = state.get("llm_input_messages") or state["messages"]
+    ...
 
 builder = StateGraph(AgentState, context_schema=PowerContextScope)
 builder.add_node("recall", PowerContextRecall())
 builder.add_node("model", call_model)
-builder.add_node("tools", ToolNode([*my_tools, *powercontext_tools()]))
 builder.add_edge(START, "recall")
 builder.add_edge("recall", "model")
 
@@ -45,7 +81,7 @@ graph = builder.compile(checkpointer=my_checkpointer)
 graph.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
 ```
 
-The recall node and the tools read the active `PowerContextScope` from the LangGraph runtime, so a single value on
+The recall hook and the tools read the active `PowerContextScope` from the LangGraph runtime, so a single value on
 `context` configures the whole run. Outside a run — for example when a tool is exercised directly — they fall back to
 the environment settings below.
 
