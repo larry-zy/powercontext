@@ -45,8 +45,10 @@ agent = create_react_agent(
     context_schema=PowerContextScope,
     checkpointer=my_checkpointer,
 )
-agent.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
+await agent.ainvoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
 ```
+
+召回 hook 和 Memory 工具都是异步的，因此请用 `ainvoke`/`astream` 驱动图；同步的 `invoke`/`stream` 无法运行它们。
 
 在自定义图中，为 state 增加一个 `llm_input_messages` 通道，并让模型步骤读取它：
 
@@ -73,7 +75,7 @@ builder.add_edge(START, "recall")
 builder.add_edge("recall", "model")
 
 graph = builder.compile(checkpointer=my_checkpointer)
-graph.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
+await graph.ainvoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
 ```
 
 召回 hook 和工具都从 LangGraph runtime 读取当前 `PowerContextScope`，因此 `context` 上的单个值即可配置整轮运行。在

@@ -51,9 +51,11 @@ def test_missing_scope_outside_repository_raises(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(which("git") is None, reason="git is required to derive a scope from a remote")
 def test_git_remote_is_derived_and_credentials_dropped(tmp_path: Path) -> None:
-    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    git = which("git")
+    assert git is not None
+    subprocess.run([git, "init", "--quiet"], cwd=tmp_path, check=True)
     subprocess.run(
-        ["git", "remote", "add", "origin", "https://user:secret@github.com/oceanbase/powercontext.git"],
+        [git, "remote", "add", "origin", "https://user:secret@github.com/oceanbase/powercontext.git"],
         cwd=tmp_path,
         check=True,
     )
@@ -75,6 +77,25 @@ def test_normalize_git_remote_forms(remote: str, expected: str) -> None:
     assert normalize_git_remote(remote) == expected
 
 
-@pytest.mark.parametrize("remote", ["", "not-a-remote", "/local/path/only"])
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "",
+        "not-a-remote",
+        "/local/path/only",
+        # Windows drive-letter paths parse as an SCP ``host:path`` whose host is the drive letter. They are local
+        # filesystem paths, not network remotes, and must not be turned into a scope.
+        r"C:\work\tenant-repo.git",
+        "C:/work/tenant-repo.git",
+        r"D:\repos\api",
+    ],
+)
 def test_normalize_git_remote_rejects_non_network_remotes(remote: str) -> None:
     assert normalize_git_remote(remote) is None
+
+
+@pytest.mark.parametrize("remote", [r"C:\work\tenant-repo.git", "C:/work/tenant-repo.git"])
+def test_resolve_scope_id_rejects_windows_local_remote(monkeypatch: pytest.MonkeyPatch, remote: str) -> None:
+    monkeypatch.setattr("powercontext_langgraph.scope._git_remote", lambda _cwd: remote)
+    with pytest.raises(MissingScopeError):
+        resolve_scope_id(None, cwd="/irrelevant")

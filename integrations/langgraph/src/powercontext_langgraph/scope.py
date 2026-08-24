@@ -44,7 +44,7 @@ class PowerContextScope:
     LangGraph 1.x passes run-scoped configuration through ``context_schema``, which nodes receive as
     ``Runtime[ContextT]``. Supplying this dataclass makes the scope an explicit invocation argument::
 
-        graph.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
+        await graph.ainvoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
 
     Separate invocations of one compiled graph can carry separate scopes, which supports multi-tenant
     deployment directly. Every field is optional; unset fields fall back to the environment settings.
@@ -90,6 +90,11 @@ def normalize_git_remote(remote: str) -> str | None:
     scp_match = _SCP_REMOTE.fullmatch(value)
     if scp_match and "://" not in value:
         host = scp_match.group("host").lower()
+        # A single-character host is a Windows drive letter (``C:\repo`` / ``C:/repo``): a machine-local path, not a
+        # network remote. Binding a tenant scope to a local drive would place unrelated runs together, so it yields
+        # no scope and the caller raises MissingScopeError.
+        if len(host) == 1 and host.isalpha():
+            return None
         path = _normalize_path(scp_match.group("path"))
         return f"{host}/{path}" if path else None
     parsed = urlsplit(value)

@@ -50,8 +50,11 @@ agent = create_react_agent(
     context_schema=PowerContextScope,
     checkpointer=my_checkpointer,
 )
-agent.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
+await agent.ainvoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
 ```
+
+The recall hook and the Memory tools are async, so drive the graph with `ainvoke`/`astream`; a synchronous
+`invoke`/`stream` cannot run them.
 
 In a custom graph, add an `llm_input_messages` channel to the state and have the model step read it:
 
@@ -78,7 +81,7 @@ builder.add_edge(START, "recall")
 builder.add_edge("recall", "model")
 
 graph = builder.compile(checkpointer=my_checkpointer)
-graph.invoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
+await graph.ainvoke(state, context=PowerContextScope(scope_id="git:github.com/acme/api"))
 ```
 
 The recall hook and the tools read the active `PowerContextScope` from the LangGraph runtime, so a single value on
