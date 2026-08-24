@@ -46,6 +46,10 @@ builtin = [
     "sqlalchemy[asyncio]>=2,<3",
     "sqlite-vec>=0.1.9,<0.2",
 ]
+seekdb = [
+    "powercontext[builtin]",
+    "pylibseekdb>=1.3.0.post4,<2; sys_platform == 'linux' or sys_platform == 'darwin'",
+]
 client = [
     "httpx[socks]>=0.28,<1",
     "opentelemetry-api>=1.30,<2",

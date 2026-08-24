@@ -44,6 +44,7 @@ from sqlalchemy import bindparam, text
 from powercontext.builtin.artifacts.experience import ExperienceCandidateInput, ExperienceContent
 from powercontext.builtin.artifacts.skill import CodexSkillRoot
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig, OceanBaseProfile
+from powercontext.builtin.persistence.seekdb import SeekDBConfig, SeekDBProfile
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
 from powercontext.builtin.runtime import DatabaseConfig, ExternalSkillsConfig, RuntimeConfig
 from powercontext.builtin.sources import ContentSource
@@ -2060,7 +2061,7 @@ async def _purge_existing_harness_scopes(database: DatabaseConfig) -> dict[str, 
 
 
 async def _discover_harness_scopes(database: DatabaseConfig) -> tuple[str, ...]:
-    async def discover(profile: OceanBaseProfile | SQLiteProfile) -> tuple[str, ...]:
+    async def discover(profile: OceanBaseProfile | SeekDBProfile | SQLiteProfile) -> tuple[str, ...]:
         scopes: set[str] = set()
         async with profile.database.transaction() as connection:
             for table_name in _SCOPE_TABLES:
@@ -2077,6 +2078,9 @@ async def _discover_harness_scopes(database: DatabaseConfig) -> tuple[str, ...]:
     if isinstance(database, OceanBaseConfig):
         async with OceanBaseProfile.open(database, tables=()) as profile:
             return await discover(profile)
+    if isinstance(database, SeekDBConfig):
+        async with SeekDBProfile.open(database, tables=()) as profile:
+            return await discover(profile)
     async with SQLiteProfile.open(database, tables=()) as profile:
         return await discover(profile)
 
@@ -2085,12 +2089,15 @@ async def _database_scope_counts(
     database: DatabaseConfig,
     scopes: tuple[str, ...],
 ) -> dict[str, dict[str, int]]:
-    async def count(profile: OceanBaseProfile | SQLiteProfile) -> dict[str, dict[str, int]]:
+    async def count(profile: OceanBaseProfile | SeekDBProfile | SQLiteProfile) -> dict[str, dict[str, int]]:
         async with profile.database.transaction() as connection:
             return await _scope_counts(connection, scopes)
 
     if isinstance(database, OceanBaseConfig):
         async with OceanBaseProfile.open(database, tables=()) as profile:
+            return await count(profile)
+    if isinstance(database, SeekDBConfig):
+        async with SeekDBProfile.open(database, tables=()) as profile:
             return await count(profile)
     async with SQLiteProfile.open(database, tables=()) as profile:
         return await count(profile)
@@ -2100,7 +2107,7 @@ async def _purge_database_scopes(
     database: DatabaseConfig,
     scopes: tuple[str, ...],
 ) -> dict[str, object]:
-    async def purge(profile: OceanBaseProfile | SQLiteProfile) -> dict[str, object]:
+    async def purge(profile: OceanBaseProfile | SeekDBProfile | SQLiteProfile) -> dict[str, object]:
         async with profile.database.transaction() as connection:
             before = await _scope_counts(connection, scopes)
             if scopes:
@@ -2130,6 +2137,9 @@ async def _purge_database_scopes(
 
     if isinstance(database, OceanBaseConfig):
         async with OceanBaseProfile.open(database, tables=()) as profile:
+            return await purge(profile)
+    if isinstance(database, SeekDBConfig):
+        async with SeekDBProfile.open(database, tables=()) as profile:
             return await purge(profile)
     async with SQLiteProfile.open(database, tables=()) as profile:
         return await purge(profile)

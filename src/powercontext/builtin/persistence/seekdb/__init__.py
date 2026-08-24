@@ -1,4 +1,3 @@
-#!/bin/sh
 # Copyright (c) 2026 OceanBase.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -eu
+"""Embedded seekDB async relational profile."""
 
-echo 1 > /logs/verifier/reward.txt
+from powercontext.builtin.persistence.seekdb.profile import (
+    SeekDBConfig,
+    SeekDBProfile,
+    SeekDBUnavailableError,
+)
+
+__all__ = (
+    "SeekDBConfig",
+    "SeekDBProfile",
+    "SeekDBUnavailableError",
+)

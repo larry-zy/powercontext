@@ -1,4 +1,3 @@
-#!/bin/sh
 # Copyright (c) 2026 OceanBase.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -eu
+FROM python:3.12-slim-bookworm
 
-echo 1 > /logs/verifier/reward.txt
+WORKDIR /workspace
