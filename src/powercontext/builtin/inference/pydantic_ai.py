@@ -1,16 +1,32 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Optional adapters backed by application-injected Pydantic AI objects."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import Generic, TypeVar, cast
+from copy import copy
+from typing import Generic, Self, TypeVar, cast
 
 from pydantic import BaseModel, Field
 
 from powercontext.builtin.artifacts.memory.canonical import canonical_embedding
 from powercontext.builtin.artifacts.memory.models import EmbeddingProfile
 from powercontext.builtin.inference.errors import (
+    InferenceConfigurationError,
     InferenceError,
     InferenceTimeoutError,
     InferenceUnavailableError,
@@ -23,7 +39,7 @@ from powercontext.builtin.inference.models import (
 )
 
 
-class PydanticAIConfigurationError(InferenceError, RuntimeError):
+class PydanticAIConfigurationError(InferenceConfigurationError):
     """Raised when the Pydantic AI adapter cannot be configured safely."""
 
     def __init__(self, code: str, detail: object | None = None) -> None:
@@ -59,7 +75,8 @@ try:
         UsageLimitExceeded,
         UserError,
     )
-    from pydantic_ai.models import Model
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+    from pydantic_ai.models import Model, ModelRequestParameters
     from pydantic_ai.settings import ModelSettings
     from pydantic_ai.usage import RunUsage, UsageLimits
     from pydantic_core import PydanticSerializationError
@@ -91,6 +108,7 @@ class PydanticAIStructuredGenerator(Generic[InputT, OutputT]):
         output_type: type[OutputT],
         limits: InferenceLimits | None = None,
         model_settings: ModelSettings | None = None,
+        name: str | None = None,
     ) -> None:
         if isinstance(model, str) or not isinstance(model, Model):
             raise PydanticAIConfigurationError("model-instance")
@@ -106,6 +124,7 @@ class PydanticAIStructuredGenerator(Generic[InputT, OutputT]):
                 instructions=instructions,
                 model_settings=model_settings,
                 retries=self._limits.max_requests - 1,
+                name=name,
             )
         except (PydanticSchemaGenerationError, PydanticUserError, UserError) as error:
             raise PydanticAIConfigurationError("schema") from error
@@ -167,6 +186,14 @@ class PydanticAIEmbeddingModel:
         self.profile = profile
         self._batch_size = batch_size
         self._limits = InferenceLimits() if limits is None else limits
+
+    def _without_instrumentation(self) -> Self:
+        """Copy this adapter for readiness without changing operational tracing."""
+
+        adapter = copy(self)
+        adapter._embedder = copy(self._embedder)
+        adapter._embedder.instrument = False
+        return adapter
 
     async def embed(self, texts: tuple[str, ...], /) -> EmbeddingResult:
         """Embed documents and validate order, count, dimension, and finite values."""
@@ -236,6 +263,36 @@ class PydanticAIEmbeddingModel:
         return tuple(vectors)
 
 
+async def probe_pydantic_ai_model(
+    model: Model,
+    /,
+    *,
+    timeout_seconds: float,
+) -> None:
+    """Send one minimal text request through an assembled generation model."""
+
+    if isinstance(model, str) or not isinstance(model, Model):
+        raise PydanticAIConfigurationError("model-instance")
+    try:
+        await asyncio.wait_for(
+            model.request(
+                [ModelRequest(parts=[UserPromptPart("Reply with one token.")])],
+                ModelSettings(max_tokens=1),
+                ModelRequestParameters(),
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        mapped = _map_error(error, operation="generate", timeout_seconds=timeout_seconds)
+        if mapped is None:
+            raise
+        if mapped is error:
+            raise
+        raise mapped from error
+
+
 def _generation_usage(value: RunUsage) -> InferenceUsage:
     return InferenceUsage(
         requests=value.requests,
@@ -274,4 +331,5 @@ __all__ = [
     "PydanticAIConfigurationError",
     "PydanticAIEmbeddingModel",
     "PydanticAIStructuredGenerator",
+    "probe_pydantic_ai_model",
 ]

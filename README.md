@@ -1,74 +1,123 @@
 # PowerContext
 
-PowerContext gives agents durable, project-scoped context. A later session can recover a decision, outcome, current
-state, or next step without relying on chat history. PowerContext includes a local Server, SQLite storage, an
-async Python client, a Core SDK, a CLI, and a Codex plugin.
+**Not only memory**
 
-PowerContext can be installed directly from its Git URL. Users need read access to that URL, but they do not need to
-clone the repository or run commands from its working tree.
+[![PyPI version](https://img.shields.io/pypi/v/powercontext)](https://pypi.org/project/powercontext/)
+[![License Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-community-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/74cF8vbNEs)
 
-## Install for Codex
+*[English](README.md) · [中文](README_CN.md) · [日本語](README_JP.md)*
 
-Prerequisites:
+PowerContext is the upgraded version of [PowerMem](https://www.powermem.ai/) and a context runtime for human-agent
+collaboration. It turns shared work into project context that can be understood, handed off, and continued.
 
-- macOS or Linux;
-- [uv](https://docs.astral.sh/uv/getting-started/installation/);
-- Codex CLI;
-- read access to `oceanbase/powercontext`.
+## Quick start
 
-Install the tool and configure the Codex plugin:
+You need macOS or Linux, Python 3.11 or newer, [`uv`](https://docs.astral.sh/uv/), and at least one supported agent
+host.
+
+### 1. Install PowerContext and integrations
 
 ```bash
-uv tool install "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@main"
-powercontext setup codex --source oceanbase/powercontext --ref main
+uv tool install "powercontext[cli,server]==0.0.2"
+
+# Choose one or more integrations.
+powercontext setup codex --source oceanbase/powercontext --ref v0.0.2
+powercontext setup claude-code --source oceanbase/powercontext --ref v0.0.2
+powercontext setup dsh --source oceanbase/powercontext --ref v0.0.2
+powercontext setup hermes --source oceanbase/powercontext --ref v0.0.2
 ```
 
-You do not need to create or manage a repository checkout. Start the local service in a terminal:
+The first command installs the CLI and local Server in an isolated environment. The subsequent setup commands
+install the corresponding integrations from the matching repository tag. Run setup again to refresh an existing
+installation.
+
+### 2. Start and verify the local Server
+
+Keep the Server running in one terminal:
 
 ```bash
 powercontext server run
 ```
 
-In another terminal, verify the package, plugin, Server, and database:
+In another terminal, verify the service and plugin:
 
 ```bash
 powercontext doctor
+powercontext doctor codex  # or: claude-code / dsh / hermes
 ```
 
-Start a new Codex session after installation. Open `/hooks` once and approve the PowerContext hook if Codex asks for
-trust. The default database is persistent and requires no configuration.
+By default, the Server listens on `127.0.0.1:8000`, exposes Streamable HTTP MCP at `/mcp`, and persists data in a
+local SQLite database. Explicit Memory operations work without configuring an inference provider.
 
-See the [Codex quickstart](docs/en/docs/tutorials/codex-quickstart.md) for a first cross-session workflow.
+## Core capabilities
 
-## Choose an interface
-
-| Interface | Use it for |
+| Capability | Core value |
 | --- | --- |
-| Codex plugin | Restore relevant project memory and explicitly remember, revise, or retire entries while coding |
-| CLI | Install the plugin, run or connect to the Server, inspect content, and diagnose an installation |
-| Python client | Call the Server's Source and Memory API from an application |
-| Core SDK | Embed PowerContext contracts or supply custom adapters in a Python system |
-| HTTP and MCP | Integrate a non-Python process or an agent host with the running Server |
+| Memory extraction and management | Explicitly record decisions, constraints, outcomes, state, and next steps worth reusing over time; with a generation model configured, Memory can also be extracted from Sources. Revisions and retirements preserve history |
+| Bounded request-time recall | Before an agent handles a request, generate one schema-validated, cited `PreparedContext` based on project scope, relevance, and a byte budget; recall failures do not block the original task |
+| Handoff | Organize the objective, verified progress, blockers, next step, and evidence into an inspectable work package so another session, task, model, or agent host can continue from a clear state |
+| Sources and evidence lineage | Preserve the original sources of knowledge and link Memory and Artifacts with exact citations; capturing a prompt creates only a Source and does not directly turn it into Memory |
+| Experience and Skill governance | A model or caller can only submit a Candidate; an immutable revision is created only after Review, and a Skill must still be exported explicitly—it cannot approve, install, or execute itself |
+| Local and service deployment | Use SQLite directly for local development, choose OceanBase for team deployments, and integrate with existing systems through HTTP/OpenAPI, MCP, authentication, and OpenTelemetry |
 
-The [interface reference](docs/en/docs/reference/interfaces.md) explains the ownership boundary between these
-surfaces. Installation, configuration, and troubleshooting live under [`docs/en/docs/`](docs/en/docs/index.md).
+## Benchmarks
 
-## Python projects
+### [LoCoMo](https://github.com/snap-research/locomo)
 
-Add only the role the project imports:
+![LOCOMO benchmark comparison showing PowerContext accuracy, search latency, and answer token usage against PowerMem and a full-context baseline](docs/assets/locomo-benchmark-comparison.svg)
 
-```bash
-uv add "powercontext[client] @ git+https://github.com/oceanbase/powercontext.git@main"
-```
+### [SWE-bench Pro public v2](https://github.com/scaleapi/SWE-bench_Pro-os)
 
-Available extras are `builtin`, `client`, `server`, and `cli`. The CLI always includes Server-backed content commands;
-installing the `server` role also makes local Server process management available.
+![SWE-bench Pro public v2 comparison showing an increase from 82.35% with PowerContext off to 86.73% with PowerContext on](docs/assets/swe-bench-pro-public-v2-comparison.svg)
+
+The evaluation ran in a Codex environment, with both the PowerContext OFF and ON groups using the `gpt-5.6-sol`
+model.
+
+---
+
+## Integrations
+
+PowerContext provides official integrations and installation guides for Codex, Claude Code, DeepSeek Harness, Hermes
+Agent, and Pi Coding Agent. These integrations use the same scoped data and history-preserving contracts through
+PowerContext Server; the host integrations do not start or embed the Server.
+
+### Official integrations
+
+<table>
+<tr>
+<td align="center" width="120"><a href="docs/en/docs/how-to/configure-codex.md"><img src="https://github.com/openai.png?size=120" alt="Codex" width="48" height="48" /><br /><sub><b>Codex</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/how-to/configure-claude-code.md"><img src="https://github.com/anthropics.png?size=120" alt="Claude Code" width="48" height="48" /><br /><sub><b>Claude Code</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/how-to/configure-dsh.md"><img src="https://github.com/deepseek-ai.png?size=120" alt="DeepSeek Harness" width="48" height="48" /><br /><sub><b>DeepSeek Harness</b></sub></a></td>
+<td align="center" width="120"><a href="integrations/hermes/README.md"><img src="https://github.com/NousResearch/hermes-agent/blob/main/website/static/img/logo.png?raw=true&size=120" alt="Hermes Agent" width="48" height="48" /><br /><sub><b>Hermes Agent</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/how-to/configure-pi.md"><img src="https://github.com/earendil-works.png?size=120" alt="Pi Coding Agent" width="48" height="48" /><br /><sub><b>Pi Coding Agent</b></sub></a></td>
+</tr>
+</table>
 
 ## Development
 
-Repository contributors can install the locked environment and hooks with `make install`. Use `make test`,
-`make check`, and `make docs-test` before opening a pull request. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full
-workflow and [`docs/en/development/`](docs/en/development/core-protocol.md) for implementation guides.
+Install the locked development environment and hooks:
+
+```bash
+make install
+```
+
+Run the main validation commands before opening a pull request:
+
+```bash
+make check
+make test
+make docs-test
+```
+
+After changing `openapi/powercontext.yaml`, run `make contract-test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+complete workflow and [`docs/en/development/`](docs/en/development/core-protocol.md) for implementation guides.
+
+## Community
+
+Questions and feedback are welcome in [Discord](https://discord.com/invite/74cF8vbNEs). Use
+[GitHub Issues](https://github.com/oceanbase/powercontext/issues) for reproducible defects and focused feature
+requests.
 
 ## License
 

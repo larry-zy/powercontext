@@ -1,3 +1,17 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Async engine ownership and explicit transaction boundaries."""
 
 from __future__ import annotations
@@ -68,6 +82,12 @@ class AsyncDatabase:
         """Use ``bound`` when supplied, otherwise own a transaction."""
 
         return self.transaction() if bound is None else nullcontext(bound)
+
+    async def ping(self) -> None:
+        """Verify that the configured database can execute a trivial query."""
+
+        async with self.transaction() as connection:
+            await connection.exec_driver_sql("SELECT 1")
 
     async def close(self) -> None:
         """Drain active transactions, then dispose only an owned engine."""

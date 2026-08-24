@@ -1,3 +1,17 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Server-owned standard library logging configuration."""
 
 from __future__ import annotations
@@ -9,6 +23,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from opentelemetry import trace
+from typing_extensions import override
 
 from powercontext.server.settings import ServerLoggingConfig
 
@@ -29,6 +44,7 @@ _OPERATIONAL_FIELDS = (
 
 
 class OperationalContextFilter(logging.Filter):
+    @override
     def filter(self, record: logging.LogRecord) -> bool:
         span_context = trace.get_current_span().get_span_context()
         if span_context.is_valid:
@@ -45,6 +61,7 @@ class OperationalContextFilter(logging.Filter):
 class JsonFormatter(logging.Formatter):
     """Render a stable operational record without serializing arbitrary extras."""
 
+    @override
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
@@ -61,6 +78,7 @@ class JsonFormatter(logging.Formatter):
 
 
 class _HumanContextFilter(OperationalContextFilter):
+    @override
     def filter(self, record: logging.LogRecord) -> bool:
         super().filter(record)
         request_id = getattr(record, "request_id", None)

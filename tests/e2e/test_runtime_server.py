@@ -1,3 +1,17 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import asyncio
@@ -25,28 +39,48 @@ from powercontext.builtin.artifacts.memory import (
     MemoryCandidateRequest,
     MemoryEntryInput,
 )
-from powercontext.builtin.inference import EmbeddingResult
+from powercontext.builtin.inference import EmbeddingResult, InferenceConfigurationError
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
-from powercontext.builtin.runtime import InferenceConfig
+from powercontext.builtin.runtime import (
+    HandoffReportConfig,
+    InferenceConfig,
+    MemorySearchPage,
+    ScopedMemoryApplication,
+)
+from powercontext.builtin.runtime import (
+    SearchMemoryRequest as RuntimeSearchMemoryRequest,
+)
 from powercontext.builtin.sources import ContentSource
 from powercontext.client import PowerContextClient, ServerResponseError
+from powercontext.errors import RevisionConflictError
 from powercontext.http import (
+    AcknowledgeHandoffRequest,
     ActivateHandoffRequest,
     CaptureContentSourceRequest,
     CommitHandoffRequest,
     ContinueHandoffRequest,
+    CreateHandoffReportProjectRequest,
+    CreateWorkContractRequest,
     FinalizeHandoffRequest,
     FlushMemoryRequest,
+    GetHandoffReportRequest,
     GetMemoryEntryRequest,
+    HandoffCurrentWorkRequest,
     HandoffSelection,
+    HandoffSourceCitation,
     ListMemoryChangesRequest,
     ListMemoryEntriesRequest,
     PrepareContextRequest,
+    ReadinessStatus,
+    RecordTaskOutcomeRequest,
+    RegisterHandoffReportWorkstreamRequest,
     RememberMemoryRequest,
+    ReportFormat,
     RetireMemoryEntryRequest,
     ReviseMemoryEntryRequest,
     SearchMemoryRequest,
+    WorkstreamKind,
 )
 from powercontext.http import MemorySearchMode as HttpMemorySearchMode
 from powercontext.server.factory import create_server_app
@@ -85,6 +119,13 @@ class KeywordEmbeddingModel:
         )
 
 
+class MisconfiguredEmbeddingModel:
+    profile = EMBEDDING_PROFILE
+
+    async def embed(self, _texts: tuple[str, ...], /) -> EmbeddingResult:
+        raise InferenceConfigurationError("secret provider response")  # noqa: TRY003 - verifies redaction
+
+
 class DeterministicHandoffPipeline:
     async def generate(self, request: HandoffGenerationRequest, /) -> RuntimeHandoffDraft:
         citations = tuple(item.citation for item in request.evidence)
@@ -109,10 +150,12 @@ def _server_settings(
     *,
     generation_model: str | None = None,
     mcp: bool = False,
+    handoff_report: bool = False,
 ) -> ServerSettings:
     return ServerSettings(
         database=SQLiteConfig(url=f"sqlite+aiosqlite:///{database}"),
         inference=InferenceConfig(generation_model=generation_model),
+        handoff_report=HandoffReportConfig(enabled=handoff_report),
         mcp=McpConfig(enabled=mcp),
     )
 
@@ -166,7 +209,7 @@ def test_server_databases_share_source_to_memory_search_behavior(
             )
             entries = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=scope_id))
 
-        assert readiness.checks == {"runtime": "ready"}
+        assert readiness.checks == {"runtime": "ready", "database": "ready"}
         assert capabilities.source_types == ["content"]
         assert capabilities.memory_extraction is True
         assert capabilities.search_modes == ["auto", "fts"]
@@ -185,6 +228,93 @@ def test_server_databases_share_source_to_memory_search_behavior(
         assert unrelated.hits == []
         assert entries.memory == flushed.memory
         assert entries.entries[0].source_refs[0].source_id == "turn-1"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
+def test_server_databases_keep_case_and_accent_variant_identities_distinct(
+    database_kind: str,
+    tmp_path: Path,
+) -> None:
+    if database_kind == "oceanbase":
+        if OCEANBASE_URL is None:
+            pytest.skip("set POWERCONTEXT_TEST_OCEANBASE_URL to a dedicated OceanBase MySQL-mode test database")
+        database = OceanBaseConfig(url=SecretStr(OCEANBASE_URL))
+    else:
+        database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'identity.db'}")
+    marker = uuid4().hex[:12]
+    writer_scope = f"PC-{marker}-Alpha"
+    reader_scope = writer_scope.lower()
+    accent_scope = f"{marker}-café"
+    plain_scope = f"{marker}-cafe"
+    memory_text = "Rotate the production signing key every ninety days."
+    app = create_server_app(
+        settings=ServerSettings(database=database, mcp=McpConfig(enabled=False)),
+    )
+
+    async def scenario() -> None:
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as transport,
+        ):
+            client = PowerContextClient("http://testserver", http_client=transport)
+            await client.remember_memory(RememberMemoryRequest(scope_id=writer_scope, kind="fact", text=memory_text))
+            leaked = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=reader_scope))
+            await client.remember_memory(
+                RememberMemoryRequest(scope_id=accent_scope, kind="fact", text="Espresso is on the third floor.")
+            )
+            accent_leaked = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=plain_scope))
+            source_scope = f"{marker}-src"
+            await client.capture_content_source(
+                CaptureContentSourceRequest(scope_id=source_scope, source_id="Turn-1", content="uppercase turn")
+            )
+            second = await client.capture_content_source(
+                CaptureContentSourceRequest(scope_id=source_scope, source_id="turn-1", content="lowercase turn")
+            )
+
+        assert not leaked.entries
+        assert leaked.memory is None
+        assert not accent_leaked.entries
+        assert second.position == 2
+
+    asyncio.run(scenario())
+
+
+def test_inference_failure_degrades_readiness_without_blocking_database_operations(tmp_path: Path) -> None:
+    app = create_server_app(
+        settings=_server_settings(tmp_path / "degraded.db"),
+        embedding_model=MisconfiguredEmbeddingModel(),
+    )
+
+    async def scenario() -> None:
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as transport,
+        ):
+            client = PowerContextClient("http://testserver", http_client=transport)
+            readiness = await client.get_readiness()
+            captured = await client.capture_content_source(
+                CaptureContentSourceRequest(
+                    scope_id="degraded-readiness",
+                    source_id="turn-1",
+                    content="Database-backed capture remains available.",
+                )
+            )
+
+        assert readiness.status is ReadinessStatus.DEGRADED
+        assert readiness.checks == {
+            "runtime": "ready",
+            "database": "ready",
+            "inference.embedding": "misconfigured",
+        }
+        assert captured.position == 1
 
     asyncio.run(scenario())
 
@@ -282,6 +412,181 @@ def test_sdk_handoff_lifecycle_reaches_generation_and_persistence(tmp_path: Path
     asyncio.run(scenario())
 
 
+def test_sdk_closes_the_delegation_handoff_and_outcome_loop(tmp_path: Path) -> None:
+    scope_id = "work-continuity-e2e"
+    app = create_server_app(settings=_server_settings(tmp_path / "work-continuity.db", handoff_report=True))
+
+    async def scenario() -> None:
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as transport,
+        ):
+            client = PowerContextClient("http://testserver", http_client=transport)
+            project = await client.create_handoff_report_project(
+                CreateHandoffReportProjectRequest(project_key="work-continuity", title="Work continuity")
+            )
+            await client.register_handoff_report_workstream(
+                RegisterHandoffReportWorkstreamRequest(
+                    project_id=project.project_id,
+                    scope_id=scope_id,
+                    title="Work continuity implementation",
+                    kind=WorkstreamKind.FEATURE,
+                )
+            )
+            contract = await client.create_work_contract(
+                CreateWorkContractRequest.model_validate({
+                    "scope_id": scope_id,
+                    "source_id": "contract-1",
+                    "contract": {
+                        "schema": "powercontext.work-contract.v1",
+                        "trust": "untrusted_input",
+                        "objective": "Implement and verify the work-continuity loop.",
+                        "facts": [
+                            {
+                                "text": "The repository already has an explicit Handoff lifecycle.",
+                                "basis": "declared",
+                                "evidence": [],
+                            }
+                        ],
+                        "in_scope": ["Reuse the existing Handoff Artifact."],
+                        "exclusions": ["Do not add an Agent scheduler."],
+                        "completion_criteria": ["A receiver can acknowledge exact Handoff evidence."],
+                        "authorization_notes": ["This record does not grant tool execution authority."],
+                        "open_questions": [],
+                    },
+                })
+            )
+            prepared = await client.handoff_current_work(
+                HandoffCurrentWorkRequest.model_validate({
+                    "scope_id": scope_id,
+                    "source_id": "boundary-1",
+                    "handoff": {
+                        "schema": "powercontext.current-work-handoff.v1",
+                        "trust": "untrusted_input",
+                        "objective": "Implement and verify the work-continuity loop.",
+                        "state": [
+                            {
+                                "text": "The high-level Runtime path is implemented.",
+                                "basis": "declared",
+                                "evidence": [],
+                            }
+                        ],
+                        "disposition": "continuable",
+                        "next_action": {
+                            "text": "Run the public Server acceptance test.",
+                            "basis": "declared",
+                            "evidence": [],
+                        },
+                        "omissions": ["Live OceanBase validation is not part of this SQLite acceptance test."],
+                    },
+                })
+            )
+            temporary_acknowledgement = await client.acknowledge_handoff(
+                AcknowledgeHandoffRequest.model_validate({
+                    "scope_id": scope_id,
+                    "source_id": "receipt-temporary-1",
+                    "receiver": "codex-receiver",
+                    "status": "accepted",
+                    "selection": HandoffSelection.PREPARED,
+                    "receiver_checks": {
+                        "live_state": "confirmed",
+                        "capability": "confirmed",
+                        "authorization": "confirmed",
+                    },
+                    "prepared": prepared.handoff,
+                })
+            )
+            committed = await client.commit_handoff(CommitHandoffRequest(scope_id=scope_id, handoff=prepared.handoff))
+            durable_acknowledgement = await client.acknowledge_handoff(
+                AcknowledgeHandoffRequest.model_validate({
+                    "scope_id": scope_id,
+                    "source_id": "receipt-durable-1",
+                    "receiver": "human-reviewer",
+                    "status": "accepted",
+                    "selection": "exact",
+                    "receiver_checks": {
+                        "live_state": "confirmed",
+                        "capability": "confirmed",
+                        "authorization": "confirmed",
+                    },
+                    "revision": committed.reference,
+                })
+            )
+            outcome = await client.record_task_outcome(
+                RecordTaskOutcomeRequest.model_validate({
+                    "scope_id": scope_id,
+                    "source_id": "outcome-1",
+                    "outcome": {
+                        "schema": "powercontext.task-outcome.v1",
+                        "trust": "untrusted_observation",
+                        "objective": "Implement and verify the work-continuity loop.",
+                        "status": "succeeded",
+                        "summary": "The public SQLite Server journey completed.",
+                        "handoff_receipt_ref": durable_acknowledgement.receipt.source.model_dump(),
+                        "observations": [
+                            {
+                                "text": "Both temporary and committed Handoffs were acknowledged.",
+                                "basis": "declared",
+                                "evidence": [],
+                            }
+                        ],
+                        "checks": [
+                            {
+                                "name": "SQLite Server acceptance",
+                                "status": "passed",
+                                "basis": "declared",
+                                "evidence": [],
+                            }
+                        ],
+                        "produced_artifacts": [],
+                        "remaining_work": [],
+                    },
+                })
+            )
+            report = await client.get_handoff_report(
+                GetHandoffReportRequest(
+                    project_id=project.project_id,
+                    include_evidence_checks=False,
+                    format=ReportFormat.JSON,
+                )
+            )
+
+        assert contract.kind == "work-contract"
+        assert contract.position == 1
+        assert prepared.boundary.kind == "handoff-boundary"
+        assert prepared.boundary.position == 2
+        citation = prepared.handoff.content.state[0].citations[0].root
+        assert isinstance(citation, HandoffSourceCitation)
+        assert citation.source_ref == prepared.boundary.source
+        assert temporary_acknowledgement.resolution.selection == "prepared"
+        assert temporary_acknowledgement.receipt.kind == "handoff-receipt"
+        assert temporary_acknowledgement.receipt.position == 3
+        assert committed.source_refs == [prepared.boundary.source]
+        assert durable_acknowledgement.resolution.selection == "exact"
+        assert durable_acknowledgement.resolution.selected_revision == committed.reference
+        assert durable_acknowledgement.receipt.position == 4
+        assert outcome.kind == "task-outcome"
+        assert outcome.position == 5
+        assert not isinstance(report, str)
+        assert report.report is not None
+        continuity = report.report["workstreams"][0]["continuity"]
+        assert continuity["coverage"]["transfer_state"] == "accepted"
+        assert continuity["coverage"]["outcome_state"] == "covered"
+        assert continuity["coverage"]["handoff_result_covered"] is True
+        assert [event["kind"] for event in continuity["events"]] == [
+            "work-contract",
+            "handoff-boundary",
+            "handoff-receipt",
+            "handoff-receipt",
+            "task-outcome",
+        ]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
 def test_server_databases_share_vector_and_hybrid_search_behavior(
     database_kind: str,
@@ -292,13 +597,7 @@ def test_server_databases_share_vector_and_hybrid_search_behavior(
             pytest.skip("set POWERCONTEXT_TEST_OCEANBASE_URL to a dedicated OceanBase MySQL-mode test database")
         database = OceanBaseConfig(url=SecretStr(OCEANBASE_URL))
     else:
-        configured = os.environ.get("POWERCONTEXT_VEC1_EXTENSION")
-        if configured is None or not Path(configured).is_file():
-            pytest.skip("set POWERCONTEXT_VEC1_EXTENSION to a Vec1 extension file")
-        database = SQLiteConfig(
-            url=f"sqlite+aiosqlite:///{tmp_path / 'vector-runtime.db'}",
-            vec1_extension=Path(configured),
-        )
+        database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'vector-runtime.db'}")
     scope_id = f"vector-e2e-{uuid4()}"
     app = create_server_app(
         settings=ServerSettings(
@@ -508,6 +807,36 @@ def test_runtime_conflicts_keep_http_and_sdk_error_context(tmp_path: Path) -> No
         assert caught.value.request_id is not None
 
     asyncio.run(stale_revision())
+
+
+def test_memory_search_returns_revision_conflict_as_http_409(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def conflicting_search(
+        _self: ScopedMemoryApplication,
+        _request: RuntimeSearchMemoryRequest,
+        /,
+    ) -> MemorySearchPage:
+        raise RevisionConflictError("stale", "current")
+
+    monkeypatch.setattr(ScopedMemoryApplication, "search", conflicting_search)
+    app = create_server_app(settings=_server_settings(tmp_path / "runtime.db"))
+
+    with TestClient(app) as transport:
+        response = transport.post(
+            "/v1/memory/search",
+            json={"scope_id": "project", "query": "stable searchable"},
+        )
+
+    assert response.status_code == 409
+    assert len(response.headers["X-PowerContext-Request-ID"]) == 16
+    assert int(response.headers["X-PowerContext-Request-ID"], 16) > 0
+    assert response.json()["error"] == {
+        "code": "revision_conflict",
+        "message": "The Memory Revision is stale.",
+        "details": None,
+    }
 
 
 def test_runtime_server_rejects_non_strict_transport_values(tmp_path: Path) -> None:

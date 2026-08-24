@@ -1,6 +1,6 @@
 ---
 title: 接口
-description: 在 Codex 插件、CLI、Python SDK、HTTP 和 MCP 之间选择。
+description: 在 Codex 插件、DeepSeek Harness 插件、Pi package、CLI、Python SDK、HTTP 和 MCP 之间选择。
 ---
 
 # 接口
@@ -10,22 +10,90 @@ description: 在 Codex 插件、CLI、Python SDK、HTTP 和 MCP 之间选择。
 | 接口 | 适用场景 | 安装 |
 | --- | --- | --- |
 | Codex 插件 | 在 Codex 中跨会话恢复和显式维护 Memory | `powercontext setup codex` |
+| DeepSeek Harness 插件 | 在 DeepSeek Harness 中跨会话恢复和显式维护 Memory | `powercontext setup dsh` |
+| LangGraph 适配器 | 在 LangGraph 图中提供 Memory 工具和有界召回 | `powercontext-langgraph` |
+| Pi package | 在 Pi 中跨会话恢复、使用原生 Memory/Handoff 工具和 skill | `powercontext setup pi` |
 | CLI | 配置、诊断、Server 控制、能力检查和人工 Candidate 审核 | `powercontext[cli,server]` |
 | Python Client SDK | 对运行中的 Server 发起类型化异步调用 | `powercontext[client]` |
 | Core SDK | 进程内 Source、Artifact、Trigger 和组合契约 | 基础包 |
 | HTTP | 从任意语言集成服务 | `powercontext[server]` |
-| MCP | 面向 Agent 的 Memory 与 Candidate Review 工具 | 由 Server 启用 |
+| MCP | 面向 Agent 的 Memory 与工作连续性工具 | 由 Server 启用 |
 
 ## Codex 插件
 
-project-context skill 指导 Codex 何时检索、记忆、修订或停用 Memory。Prompt Hook 会恢复相关条目，并把
-用户输入采集为 Source 证据；MCP 工具执行显式操作。插件不会启动或内嵌 Server。
+project-context skill 指导 Codex 何时检索、记忆、修订、停用、委托、交接、回执或记录结果。Prompt Hook 会恢复相关
+条目，并把用户输入采集为 Source 证据；MCP 工具执行显式操作。插件不会启动或内嵌 Server。
+
+## 工作连续性
+
+Server 通过 HTTP、Python Client 和 MCP 暴露同一个高层闭环：
+
+```text
+create_work_contract
+  -> 推进工作
+  -> handoff_current_work
+  -> continue_handoff + acknowledge_handoff
+  -> record_task_outcome
+```
+
+`create_work_contract` 为新委托记录目标、范围、完成标准、授权说明和关键待决问题。`handoff_current_work` 采集调用方已
+检查的当前状态并返回临时 Prepared Handoff；它不会发布里程碑。只有用户需要持久化里程碑时，才另行调用
+`commit_handoff`。
+
+接收方先用 prepared、exact 或 latest selection 调用 `continue_handoff`；如果从 latest 开始，必须把返回的 exact Revision
+展示并检查后再记录回执。`acknowledge_handoff` 只接受 prepared 或 exact，不接受 latest。任一 Handoff evidence 不可用，
+或 live-state、capability、authorization 没有全部确认为 `confirmed` 时，都会拒绝 accepted。接收方也可以记录
+`needs_clarification` 或 `declined`。回执及三项确认只记录不可信观察，不能授予身份、工具或执行权限。
+
+`record_task_outcome` 原样保留 `succeeded`、`partial`、`blocked`、`failed`、`cancelled` 或 `unknown`，以及精确检查
+状态。需要关闭 committed Handoff 结果时，`handoff_receipt_ref` 必须引用当前 accepted exact Receipt；同 scope 中无关联的
+Outcome 不会覆盖它。该 operation 保存现有 Experience 孵化可读取的 `task-outcome` Source，但不会自行生成或批准
+Experience。Integration 只应在真实完成或中断边界调用它，不能仅因 Prompt、Stop 或 Session 结束而调用。
+
+Claim 和 check 要么是没有 evidence 的 `declared`，要么是拥有同 scope 精确 citation 的 `verified`。Citation 可读只证明
+身份和可用性，不证明事实仍然新鲜。当前指令、实时 workspace、能力和授权始终优先于 Work 与 Handoff 记录。
+
+Handoff Report 的 JSON Workstream projection 同时返回 `handoff_revision_count`、`handoff_history_truncated` 和
+`handoff_history`。History 最多包含 frozen selection 之前最近 20 个 Revision 摘要，按 Revision 升序返回；页面按最新
+优先展示，并每 5 秒自动刷新。未发送编辑或正在执行的交接动作会暂停自动刷新。Codex scope resolver 支持把当前 Git
+工作区一次绑定到固定 Workstream scope，绑定优先于 Git remote 和路径推导，但低于显式 scope 配置。
+
+## DeepSeek Harness 插件
+
+project-context skill 指导 DeepSeek Harness 何时检索、记忆、修订或停用 Memory。每轮模型开口前，插件会恢复相关
+条目，并把用户输入采集为 Source 证据；具名 `pc_*` 工具执行显式 HTTP 操作。插件不会启动或内嵌 Server。
+
+## LangGraph 适配器
+
+`powercontext-langgraph` 通过公开的 Python Client 把 LangGraph 图连接到运行中的 Server，提供三个组件：
+`powercontext_tools()` 返回供模型显式读写 Memory 的 `BaseTool`；`PowerContextRecall` 是节点或
+`pre_model_hook`，在模型步骤前把一个有界 `PreparedContext` 作为标记为不可信历史证据的系统消息注入；
+`PowerContextScope` 是用于图 `context_schema` 的 dataclass，承载 scope 和单次运行的连接覆盖项。召回节点和工具
+从 LangGraph runtime 读取当前 scope，否则回退到 `POWERCONTEXT_LANGGRAPH_*` 环境配置。
+
+Scope 解析优先取显式 `scope_id`，其次取由 Git remote 推导的 scope，都没有时报错——这与 Codex resolver 相反，
+因为已部署的图其工作目录通常无法标识项目。`TOKEN` 是裸 token，由 Client 组装为 `Authorization: Bearer`，不同于
+Codex、Claude Code 和 DeepSeek Harness 插件使用的 `POWERCONTEXT_*_AUTHORIZATION` header。召回和工具都会失败开放：
+Server 不可用时图仍能到达终点，工具返回一段简短的不可用字符串。本次发布只覆盖 Memory 读写和有界召回；自动采集、
+checkpointing 和 Handoff 不在范围内。适配器有意不实现 `BaseStore`——Memory 模型不提供其所需的按 key 读取、upsert
+和删除操作。它不会启动或内嵌 Server。
+
+## Pi package
+
+原生 Pi package 提供 `project-context` skill、具名 `pc_*` Memory/Handoff 工具和 `/pc` 诊断命令。每次普通 agent
+启动前，它请求一个严格校验且有界的 PreparedContext，并独立采集符合条件的用户提示词作为 Source 证据。它不会同步
+Pi transcript。召回、采集和边界 flush 都会正常降级；显式持久化写入必须在交互式环境中确认。
 
 ## CLI
 
 ```text
 powercontext setup codex
+powercontext setup dsh
+powercontext setup pi
 powercontext doctor
+powercontext doctor codex
+powercontext doctor dsh
+powercontext doctor pi
 powercontext server run
 powercontext ready
 powercontext capabilities
@@ -53,6 +121,10 @@ powercontext external-skill import --scope-id project:example --fingerprint SHA2
 
 所有内容命令都调用已配置的 Server。可选的 `server` role 会增加 `powercontext server run`，但不会在 CLI
 中创建第二套内容 profile。
+
+`powercontext doctor` 检查安装包和 Server，不要求任何集成；`powercontext doctor codex` 显式检查 Codex CLI
+和 PowerContext 插件；`powercontext doctor dsh` 检查 DeepSeek Harness CLI，以及 dump-config 是否列出插件 id
+`powercontext-dsh`；`powercontext doctor pi` 检查 Pi 可执行文件，以及 Pi 是否列出了 PowerContext package。
 
 Generation 和 revision 命令通过可重复的 `--source-ref TYPE/ID` 与
 `--artifact-ref FAMILY/ID@REVISION` 接收精确引用，不再读取序列化请求文件。
@@ -179,6 +251,9 @@ Server 在 `/openapi.json` 提供 OpenAPI 文档，在 `/health/ready` 提供就
 Memory 与 Candidate Review operation 子集。五个 Candidate Review operation 通过 HTTP 和 MCP 使用相同的
 validation、`expected_version` 并发校验和 approval transaction。Experience/Skill generation、exact read、
 external Registry operation 和低阶 proposal operation 仍只通过 HTTP 提供。
+所有检查通过时 readiness 为 HTTP 200 的 `ready`；只有已配置的推理检查失败时为 HTTP 200 的 `degraded`；
+Runtime 或数据库失败时为 HTTP 503 的 `not_ready`。依赖检查使用 `ready`、`unavailable`、`timeout` 或
+`misconfigured`；有意不绑定 Runtime 时，`runtime` 检查使用 `not_ready`。
 `POST /v1/context/prepare` 及对应的 Python Client method 通过 HTTP 提供最终的临时 `PreparedContext`；
 Runtime 召回 active Memory 与 approved Experience head，统一负责选择和总输出预算；该 operation 不会投影为
 MCP tool。public schema 仍是 `powercontext.prepared-context.v1`，Experience item 在 prepared content 内携带精确

@@ -1,8 +1,6 @@
 name: Build customer artifact
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       ref:
@@ -28,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: customer-artifact-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  group: customer-artifact-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -47,16 +45,16 @@ jobs:
       - name: Check out requested source
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.0
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
@@ -68,16 +66,18 @@ jobs:
         id: metadata
         env:
           ARTIFACT_LABEL: ${{ inputs.artifact_label }}
-          SOURCE_REF: ${{ inputs.ref || github.head_ref || github.ref_name }}
+          SOURCE_REF: ${{ inputs.ref || github.ref_name }}
         run: |
           python - <<'PY'
           import os
           import re
           import subprocess
-          import tomllib
           from pathlib import Path
 
-          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          version = subprocess.check_output(
+              ["uvx", "--from", "hatchling", "--with", "hatch-vcs", "hatchling", "version"],
+              text=True,
+          ).strip()
           source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           label = os.environ.get("ARTIFACT_LABEL") or os.environ.get("SOURCE_REF") or "source"
           slug = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-.").lower() or "source"

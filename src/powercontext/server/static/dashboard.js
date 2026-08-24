@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2026 OceanBase.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 "use strict";
 
 import {
@@ -5,15 +21,16 @@ import {
   fetchWithBearer,
   readServerToken,
   storeServerToken
-} from "./auth.js";
+} from "./auth.js?v=optional-auth";
+import {createPageUi, createRequestGate} from "./page-ui.js?v=locale-complete";
 
-const themeKey = "powercontext.dashboard.theme";
-const localeKey = "powercontext.dashboard.locale";
 const translations = {
   en: {
     pageTitle: "PowerContext Dashboard",
     dashboardTitle: "Dashboard",
     handoffReportTitle: "Handoff Report",
+    brandHomeLabel: "PowerContext Dashboard",
+    primaryNavigation: "Primary navigation",
     maintainedBy: "Maintained by OceanBase.",
     signOut: "Sign out",
     authTitle: "Connect to PowerContext",
@@ -51,7 +68,8 @@ const translations = {
     switchLight: "Switch to light mode",
     switchChinese: "Switch to Chinese",
     switchEnglish: "Switch to English",
-    languageChinese: "\u4e2d\u6587",
+    languageChinese: "中文",
+    languageEnglish: "EN",
     updated: "Updated {value}",
     recallHits: "{hits} recall hits from {preparations} preparations",
     activitySummary: "{hits} recall hits · estimated token reduction {savings} in the last 30 days",
@@ -61,91 +79,104 @@ const translations = {
     authRejected: "The Server rejected this token.",
     requestFailed: "The Dashboard request failed with HTTP {status}.",
     serverUnavailable: "The Server is unavailable.",
+    retry: "Retry",
     noScopes: "No Dashboard scopes are configured.",
-    scopeUnavailable: "The selected scope is not available."
+    scopeUnavailable: "The selected scope is not available.",
+    scopeOverview: "Scope overview"
   },
   zh: {
-    pageTitle: "PowerContext \u4eea\u8868\u76d8",
-    dashboardTitle: "\u4eea\u8868\u76d8",
-    handoffReportTitle: "\u4ea4\u63a5\u62a5\u544a",
-    maintainedBy: "\u7531 OceanBase \u7ef4\u62a4\u3002",
-    signOut: "\u9000\u51fa",
-    authTitle: "\u8fde\u63a5 PowerContext",
-    authIntro: "\u8bf7\u8f93\u5165 PowerContext Server \u914d\u7f6e\u7684 bearer token\u3002Token \u4ec5\u4fdd\u7559\u5728\u5f53\u524d\u6d4f\u89c8\u5668\u6807\u7b7e\u9875\u3002",
-    tokenLabel: "\u670d\u52a1\u5668 Token",
-    continue: "\u7ee7\u7eed",
-    selectScope: "\u4f5c\u7528\u57df",
-    period30: "\u8fc7\u53bb 30 \u5929",
-    estimatedReduction: "\u9884\u4f30 Token \u51cf\u5c11\u91cf",
-    sources: "\u6570\u636e\u6e90",
-    memoryEntries: "Memory \u6761\u76ee",
-    artifacts: "Artifacts",
-    pendingReview: "\u5f85\u5ba1\u6838",
-    artifactFamilies: "Artifact \u7c7b\u578b",
-    artifactSubtitle: "\u5f53\u524d Artifact \u4e0e\u5f85\u5ba1\u6838 Candidate",
-    family: "\u7c7b\u578b",
-    currentArtifacts: "\u5f53\u524d Artifacts",
-    pendingCandidates: "\u5f85\u5ba1\u6838 Candidates",
-    experience: "Experience",
-    handoff: "Handoff",
-    memory: "Memory",
-    skill: "Skill",
-    dailyActivity: "\u6bcf\u65e5\u53ec\u56de",
-    noRecall: "\u65e0\u547d\u4e2d",
-    hitNoReduction: "\u547d\u4e2d \u00b7 \u22640",
-    reductionLow: "1\u2013255",
-    reductionMedium: "256\u20131,023",
+    pageTitle: "PowerContext 仪表盘",
+    dashboardTitle: "仪表盘",
+    handoffReportTitle: "交接报告",
+    brandHomeLabel: "PowerContext 仪表盘",
+    primaryNavigation: "主导航",
+    maintainedBy: "由 OceanBase 维护。",
+    signOut: "退出",
+    authTitle: "连接 PowerContext",
+    authIntro: "请输入 PowerContext 服务器配置的访问令牌。令牌仅保留在当前浏览器标签页。",
+    tokenLabel: "服务器访问令牌",
+    continue: "继续",
+    selectScope: "作用域",
+    period30: "过去 30 天",
+    estimatedReduction: "预估令牌减少量",
+    sources: "数据源",
+    memoryEntries: "记忆条目",
+    artifacts: "制品",
+    pendingReview: "待审核",
+    artifactFamilies: "制品类型",
+    artifactSubtitle: "当前制品与待审核候选",
+    family: "类型",
+    currentArtifacts: "当前制品",
+    pendingCandidates: "待审核候选",
+    experience: "经验",
+    handoff: "交接",
+    memory: "记忆",
+    skill: "技能",
+    dailyActivity: "每日召回",
+    noRecall: "无命中",
+    hitNoReduction: "命中 · ≤0",
+    reductionLow: "1–255",
+    reductionMedium: "256–1,023",
     reductionHigh: "1,024+",
-    recallTrend: "Recall \u8282\u7ea6\u8d8b\u52bf",
-    trendSubtitle: "\u8fc7\u53bb 30 \u5929\u7684\u9884\u4f30 Token \u51cf\u5c11\u91cf",
-    estimatedReductionSeries: "\u9884\u4f30\u51cf\u5c11\u91cf",
-    dark: "\u6df1\u8272",
-    light: "\u6d45\u8272",
-    switchDark: "\u5207\u6362\u81f3\u6df1\u8272\u6a21\u5f0f",
-    switchLight: "\u5207\u6362\u81f3\u6d45\u8272\u6a21\u5f0f",
-    switchChinese: "\u5207\u6362\u81f3\u4e2d\u6587",
-    switchEnglish: "\u5207\u6362\u81f3\u82f1\u6587",
-    languageChinese: "\u4e2d\u6587",
-    updated: "\u66f4\u65b0\u4e8e {value}",
-    recallHits: "{preparations} \u6b21\u51c6\u5907\u4e2d\u547d\u4e2d {hits} \u6b21 Recall",
-    activitySummary: "\u8fc7\u53bb 30 \u5929\u547d\u4e2d {hits} \u6b21 Recall \u00b7 \u9884\u4f30 Token \u51cf\u5c11\u91cf {savings}",
-    activityAria: "\u5f53\u524d scope \u8fc7\u53bb 30 \u5929\u7684 Recall \u547d\u4e2d\u548c\u9884\u4f30 Token \u51cf\u5c11\u91cf",
-    activityHit: "{date}\uff1a\u547d\u4e2d {hits} \u6b21 Recall \u00b7 \u9884\u4f30 Token \u51cf\u5c11\u91cf {savings}",
-    trendDescription: "Recall \u547d\u4e2d {hits} \u6b21\uff0c\u9884\u4f30 Token \u51cf\u5c11\u91cf {savings}\u3002",
-    authRejected: "Server \u62d2\u7edd\u4e86\u8be5 Token\u3002",
-    requestFailed: "Dashboard \u8bf7\u6c42\u5931\u8d25\uff08HTTP {status}\uff09\u3002",
-    serverUnavailable: "Server \u65e0\u6cd5\u8bbf\u95ee\u3002",
-    noScopes: "\u672a\u914d\u7f6e Dashboard \u4f5c\u7528\u57df\u3002",
-    scopeUnavailable: "\u9009\u4e2d\u7684\u4f5c\u7528\u57df\u4e0d\u53ef\u7528\u3002"
+    recallTrend: "召回节约趋势",
+    trendSubtitle: "过去 30 天的预估令牌减少量",
+    estimatedReductionSeries: "预估减少量",
+    dark: "深色",
+    light: "浅色",
+    switchDark: "切换至深色模式",
+    switchLight: "切换至浅色模式",
+    switchChinese: "切换至中文",
+    switchEnglish: "切换至英文",
+    languageChinese: "中文",
+    languageEnglish: "EN",
+    updated: "更新于 {value}",
+    recallHits: "{preparations} 次准备中命中 {hits} 次召回",
+    activitySummary: "过去 30 天命中 {hits} 次召回 · 预估令牌减少量 {savings}",
+    activityAria: "当前作用域过去 30 天的召回命中和预估令牌减少量",
+    activityHit: "{date}：命中 {hits} 次召回 · 预估令牌减少量 {savings}",
+    trendDescription: "召回命中 {hits} 次，预估令牌减少量 {savings}。",
+    authRejected: "服务器拒绝了该访问令牌。",
+    requestFailed: "仪表盘请求失败（HTTP {status}）。",
+    serverUnavailable: "服务器无法访问。",
+    retry: "重试",
+    noScopes: "未配置仪表盘作用域。",
+    scopeUnavailable: "选中的作用域不可用。",
+    scopeOverview: "作用域概览"
   }
 };
 const authShell = document.getElementById("auth-shell");
 const authForm = document.getElementById("auth-form");
 const authError = document.getElementById("auth-error");
 const tokenInput = document.getElementById("token");
+const pageStatus = document.getElementById("page-status");
+const pageStatusMessage = document.getElementById("page-status-message");
+const pageStatusRetry = document.getElementById("page-status-retry");
 const dashboard = document.getElementById("dashboard");
 const signOut = document.getElementById("sign-out");
-const themeToggle = document.getElementById("theme-toggle");
-const languageToggle = document.getElementById("language-toggle");
 const scopeSelect = document.getElementById("scope-select");
+const authenticationRequired = document.documentElement.dataset.serverAuthRequired === "true";
 const svgNamespace = "http://www.w3.org/2000/svg";
-let currentLocale = document.documentElement.lang === "zh" ? "zh" : "en";
 let currentView = null;
 let currentScopes = [];
 let currentAuthError = null;
-
-themeToggle.addEventListener("click", () => {
-  const currentTheme = document.documentElement.dataset.theme;
-  const nextTheme = currentTheme === "dark" ? "light" : "dark";
-  applyTheme(nextTheme);
+let currentPageStatus = null;
+let currentScopeId = "";
+const ui = createPageUi(translations, () => {
+  renderAuthError();
+  renderPageStatus();
+  if (currentView !== null) {
+    renderDashboard(currentView);
+  }
 });
-
-languageToggle.addEventListener("click", () => {
-  applyLocale(currentLocale === "en" ? "zh" : "en");
-});
+const {formatDateTime, formatNumber, translate} = ui;
+const dashboardRequests = createRequestGate();
 
 scopeSelect.addEventListener("change", async () => {
   await loadStatistics(readServerToken(), scopeSelect.value);
+});
+
+pageStatusRetry.addEventListener("click", async () => {
+  await authenticate(readServerToken(), currentScopeId);
 });
 
 authForm.addEventListener("submit", async (event) => {
@@ -160,127 +191,141 @@ signOut.addEventListener("click", () => {
   showLogin();
 });
 
-function applyTheme(theme, persist = true) {
-  document.documentElement.dataset.theme = theme;
-  if (persist) {
-    try {
-      localStorage.setItem(themeKey, theme);
-    } catch (error) {
-      // The selected theme still applies to the current page.
-    }
-  }
-  updateControlLabels();
-}
-
-function applyLocale(locale, persist = true) {
-  currentLocale = locale;
-  document.documentElement.lang = locale;
-  if (persist) {
-    try {
-      localStorage.setItem(localeKey, locale);
-    } catch (error) {
-      // The selected locale still applies to the current page.
-    }
-  }
-  document.title = translate("pageTitle");
-  document.querySelectorAll("[data-i18n]").forEach((element) => {
-    element.textContent = translate(element.dataset.i18n);
-  });
-  updateControlLabels();
-  renderAuthError();
-  if (currentView !== null) {
-    renderDashboard(currentView);
-  }
-}
-
-function updateControlLabels() {
-  const nextTheme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-  themeToggle.setAttribute("aria-label", translate(nextTheme === "dark" ? "switchDark" : "switchLight"));
-  themeToggle.setAttribute("title", translate(nextTheme === "dark" ? "switchDark" : "switchLight"));
-  languageToggle.textContent = currentLocale === "en" ? translate("languageChinese") : "EN";
-  languageToggle.setAttribute("aria-label", translate(currentLocale === "en" ? "switchChinese" : "switchEnglish"));
-}
-
 async function authenticate(token, scopeId = "") {
-  if (!token) {
+  if (authenticationRequired && !token) {
     showLogin();
     return;
   }
 
+  if (authenticationRequired) {
+    storeServerToken(token);
+  }
+  tokenInput.value = "";
+  currentAuthError = null;
+  const request = dashboardRequests.start();
   scopeSelect.disabled = true;
   try {
     const response = await fetchWithBearer("/dashboard/scopes", token);
+    if (!request.isCurrent()) {
+      return;
+    }
     if (response.status === 401) {
       clearServerToken();
       showLogin("authRejected");
       return;
     }
     if (!response.ok) {
-      showLogin("requestFailed", {status: response.status});
+      showPageStatus("requestFailed", {status: response.status}, true);
       return;
     }
     currentScopes = await response.json();
-    if (currentScopes.length === 0) {
-      showLogin("noScopes");
+    if (!request.isCurrent()) {
       return;
     }
-    storeServerToken(token);
-    tokenInput.value = "";
-    currentAuthError = null;
+    if (currentScopes.length === 0) {
+      showPageStatus("noScopes", {}, true);
+      return;
+    }
     const selectedScopeId = currentScopes.some((scope) => scope.scope_id === scopeId)
       ? scopeId
       : currentScopes[0].scope_id;
-    await loadStatistics(token, selectedScopeId);
+    currentScopeId = selectedScopeId;
+    await loadStatistics(token, selectedScopeId, request);
   } catch (error) {
-    showLogin("serverUnavailable");
+    if (request.isCurrent()) {
+      showPageStatus("serverUnavailable", {}, true);
+    }
   } finally {
-    scopeSelect.disabled = false;
+    if (request.isCurrent()) {
+      scopeSelect.disabled = false;
+    }
   }
 }
 
-async function loadStatistics(token, scopeId) {
-  if (!token) {
+async function loadStatistics(token, scopeId, request = null) {
+  if (authenticationRequired && !token) {
     showLogin();
     return;
   }
 
+  const activeRequest = request || dashboardRequests.start();
+  currentScopeId = scopeId;
   scopeSelect.disabled = true;
   try {
     const url = new URL("/v1/stats", window.location.origin);
     url.searchParams.set("scope_id", scopeId);
     url.searchParams.set("period", "30d");
     const response = await fetchWithBearer(url, token);
+    if (!activeRequest.isCurrent()) {
+      return;
+    }
     if (response.status === 401) {
       clearServerToken();
       showLogin("authRejected");
       return;
     }
     if (!response.ok) {
-      showLogin("requestFailed", {status: response.status});
+      showPageStatus("requestFailed", {status: response.status}, true);
       return;
     }
     const statistics = await response.json();
+    if (!activeRequest.isCurrent()) {
+      return;
+    }
     const selectedScope = currentScopes.find((scope) => scope.scope_id === statistics.scope_id);
     if (!selectedScope) {
-      showLogin("scopeUnavailable");
+      showPageStatus("scopeUnavailable", {}, true);
       return;
     }
     renderDashboard({scopes: currentScopes, selectedScope, statistics});
   } catch (error) {
-    showLogin("serverUnavailable");
+    if (activeRequest.isCurrent()) {
+      showPageStatus("serverUnavailable", {}, true);
+    }
   } finally {
-    scopeSelect.disabled = false;
+    if (activeRequest.isCurrent()) {
+      scopeSelect.disabled = false;
+    }
   }
 }
 
 function showLogin(messageKey = "", values = {}) {
+  dashboardRequests.cancel();
+  scopeSelect.disabled = false;
   currentView = null;
+  currentScopes = [];
+  currentScopeId = "";
+  currentPageStatus = null;
   currentAuthError = messageKey ? {key: messageKey, values} : null;
   renderAuthError();
   authShell.hidden = false;
+  pageStatus.hidden = true;
   dashboard.hidden = true;
   signOut.hidden = true;
   tokenInput.focus();
+}
+
+function showPageStatus(messageKey, values = {}, retryable = false) {
+  currentView = null;
+  currentPageStatus = {key: messageKey, values, retryable};
+  renderPageStatus();
+  authShell.hidden = true;
+  pageStatus.hidden = false;
+  dashboard.hidden = true;
+  signOut.hidden = !authenticationRequired;
+}
+
+function renderPageStatus() {
+  if (currentPageStatus === null) {
+    pageStatusMessage.textContent = "";
+    pageStatusRetry.hidden = true;
+    return;
+  }
+  pageStatusMessage.textContent = translate(
+    currentPageStatus.key,
+    currentPageStatus.values
+  );
+  pageStatusRetry.hidden = !currentPageStatus.retryable;
 }
 
 function renderAuthError() {
@@ -291,12 +336,14 @@ function renderAuthError() {
 
 function renderDashboard(view) {
   currentView = view;
+  currentPageStatus = null;
   const statistics = view.statistics;
   const inventory = statistics.inventory;
   const recall = statistics.recall;
   authShell.hidden = true;
+  pageStatus.hidden = true;
   dashboard.hidden = false;
-  signOut.hidden = false;
+  signOut.hidden = !authenticationRequired;
 
   renderScopes(view.scopes, statistics.scope_id);
   setText("dashboard-name", view.selectedScope.display_name);
@@ -546,13 +593,8 @@ function setText(id, value) {
   document.getElementById(id).textContent = value;
 }
 
-function translate(key, values = {}) {
-  const template = translations[currentLocale][key] || translations.en[key] || key;
-  return template.replace(/\{([a-zA-Z]+)\}/g, (match, name) => String(values[name] ?? match));
-}
-
 function formatFamily(value) {
-  if (translations[currentLocale][value] || translations.en[value]) {
+  if (translations[ui.locale()][value] || translations.en[value]) {
     return translate(value);
   }
   return value
@@ -561,35 +603,17 @@ function formatFamily(value) {
     .join(" ");
 }
 
-function localeTag() {
-  return currentLocale === "zh" ? "zh-CN" : "en";
-}
-
-function formatNumber(value) {
-  return new Intl.NumberFormat(localeTag()).format(value);
-}
-
 function formatCompact(value) {
-  return new Intl.NumberFormat(localeTag(), {notation: "compact", maximumFractionDigits: 1}).format(value);
+  return new Intl.NumberFormat(ui.localeTag(), {notation: "compact", maximumFractionDigits: 1}).format(value);
 }
 
 function formatDate(value) {
-  return new Intl.DateTimeFormat(localeTag(), {dateStyle: "medium", timeZone: "UTC"}).format(new Date(`${value}T00:00:00Z`));
+  return new Intl.DateTimeFormat(ui.localeTag(), {dateStyle: "medium", timeZone: "UTC"}).format(new Date(`${value}T00:00:00Z`));
 }
 
 function formatShortDate(value) {
-  return new Intl.DateTimeFormat(localeTag(), {month: "short", day: "numeric", timeZone: "UTC"}).format(new Date(`${value}T00:00:00Z`));
+  return new Intl.DateTimeFormat(ui.localeTag(), {month: "short", day: "numeric", timeZone: "UTC"}).format(new Date(`${value}T00:00:00Z`));
 }
 
-function formatDateTime(value) {
-  return new Intl.DateTimeFormat(localeTag(), {dateStyle: "medium", timeStyle: "short"}).format(new Date(value));
-}
-
-const initialTheme = document.documentElement.dataset.theme === "dark"
-  ? "dark"
-  : (document.documentElement.dataset.theme === "light"
-    ? "light"
-    : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
-applyLocale(currentLocale, false);
-applyTheme(initialTheme, false);
+ui.initialize();
 authenticate(readServerToken());

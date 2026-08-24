@@ -1,15 +1,31 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Business-specific Runtime operations over composed built-in contexts."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING
+
+from pydantic import BaseModel, ValidationError
 
 from powercontext._logging import log_safely
 from powercontext.artifacts import ArtifactRef
@@ -22,10 +38,15 @@ from powercontext.builtin.artifacts.handoff import (
     ActivateHandoff,
     Handoff,
     HandoffActivation,
+    HandoffArtifactCitation,
     HandoffAudience,
+    HandoffCitation,
     HandoffDraft,
+    HandoffOmission,
     HandoffResolution,
     HandoffService,
+    HandoffSourceCitation,
+    HandoffStatement,
     PreparedHandoff,
     PrepareHandoff,
 )
@@ -36,7 +57,11 @@ from powercontext.builtin.artifacts.memory import (
     MemoryEntryVersion,
     MemoryService,
 )
-from powercontext.builtin.artifacts.memory.errors import MemoryEntryNotFoundError
+from powercontext.builtin.artifacts.memory.errors import (
+    CapabilityNotSupportedError,
+    InvalidMemoryCitationError,
+    MemoryEntryNotFoundError,
+)
 from powercontext.builtin.artifacts.skill import (
     ExternalSkillRegistryUnavailableError,
     ExternalSkillResolution,
@@ -89,9 +114,26 @@ from powercontext.builtin.runtime.models import (
     SourceReceipt,
 )
 from powercontext.builtin.runtime.prepared_context import PreparedContextBuild, PreparedContextBuilder
-from powercontext.builtin.runtime.protocols import BuiltinTriggers, PowerContextProvider
+from powercontext.builtin.runtime.protocols import (
+    BuiltinTriggers,
+    PowerContextProvider,
+    RuntimeSpan,
+    RuntimeTracing,
+    TraceAttribute,
+)
+from powercontext.builtin.runtime.readiness import (
+    ReadinessCheckStatus,
+    RuntimeReadiness,
+    RuntimeReadinessChecks,
+)
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics
-from powercontext.builtin.sources import ContentCapture, ExternalSkillImportMode, SourceCursor, validate_scope_id
+from powercontext.builtin.sources import (
+    ContentCapture,
+    ContentSource,
+    ExternalSkillImportMode,
+    SourceCursor,
+    validate_scope_id,
+)
 from powercontext.builtin.statistics import (
     ModelUsageOperation,
     ModelUsagePurpose,
@@ -99,8 +141,30 @@ from powercontext.builtin.statistics import (
     Statistics,
     StatisticsPeriod,
 )
+from powercontext.builtin.work import (
+    HANDOFF_BOUNDARY_SOURCE_KIND,
+    HANDOFF_RECEIPT_SOURCE_KIND,
+    TASK_OUTCOME_SOURCE_KIND,
+    WORK_CONTRACT_SOURCE_KIND,
+    AcknowledgeHandoff,
+    CreateWorkContract,
+    HandoffAcknowledgement,
+    HandoffCurrentWork,
+    HandoffReceipt,
+    PreparedWorkHandoff,
+    RecordTaskOutcome,
+    TaskOutcome,
+    WorkClaim,
+    WorkContinuity,
+    WorkContract,
+    WorkSourceKind,
+    WorkSourceReceipt,
+    content_digest,
+    project_work_continuity,
+)
 from powercontext.context import PowerContext
 from powercontext.errors import ArtifactNotFoundError, RevisionConflictError
+from powercontext.sources import SourceRef
 
 if TYPE_CHECKING:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -108,6 +172,13 @@ if TYPE_CHECKING:
     from powercontext.builtin.handoff_report.application import HandoffReportApplication
 
 logger = logging.getLogger(__name__)
+
+_MEMORY_SEARCH_STAGE = "memory.search"
+_MEMORY_SEARCH_REQUESTED_MODE = "powercontext.memory.search.requested_mode"
+_MEMORY_SEARCH_LIMIT = "powercontext.memory.search.limit"
+_MEMORY_SEARCH_MEMORY_PRESENT = "powercontext.memory.search.memory_present"
+_MEMORY_SEARCH_MODE = "powercontext.memory.search.mode"
+_MEMORY_SEARCH_RESULT_COUNT = "powercontext.memory.search.result_count"
 
 ScopeIds = Callable[[], Awaitable[tuple[str, ...]]]
 ReviewServiceFactory = Callable[[str], ReviewService]
@@ -122,6 +193,7 @@ ExperienceRecall = Callable[[str, str, int], Awaitable[tuple[ExperienceSearchHit
 StatisticsServiceFactory = Callable[[str], RelationalScopedStatistics]
 RecallTokenEstimator = Callable[[str, PreparedContextBuild], Awaitable[RecallTokenMeasurement | None]]
 Clock = Callable[[], datetime]
+_MEMORY_SEARCH_ATTEMPTS = 3
 
 
 class _RuntimeConfigurationError(ValueError):
@@ -254,34 +326,76 @@ class ScopedContextApplication:
         builder = PreparedContextBuilder()
         async with (
             self._runtime._context(self.scope_id, embedding_purpose=ModelUsagePurpose.MEMORY_RECALL) as context,
-            self._runtime._lock(self.scope_id),
+            self._runtime._locked(self.scope_id),
         ):
-            service = context.artifacts.memory
-            current = await _head_or_none(service, context.artifacts.memory_artifact_id)
-            memory_hits = ()
-            if current is not None:
-                result = await service.search(
-                    request.query,
-                    memories=(current,),
-                    limit=builder.memory_candidate_limit,
-                    mode="auto",
+            with self._runtime._stage(
+                _MEMORY_SEARCH_STAGE,
+                attributes={
+                    _MEMORY_SEARCH_REQUESTED_MODE: "auto",
+                    _MEMORY_SEARCH_LIMIT: builder.memory_candidate_limit,
+                },
+            ) as span:
+                service = context.artifacts.memory
+                current = await _head_or_none(service, context.artifacts.memory_artifact_id)
+                memory_hits = ()
+                search_mode: str | None = None
+                if current is not None:
+                    result = await service.search(
+                        request.query,
+                        memories=(current,),
+                        limit=builder.memory_candidate_limit,
+                        mode="auto",
+                    )
+                    memory_hits = result.hits
+                    search_mode = result.mode
+                if span is not None:
+                    attributes: dict[str, TraceAttribute] = {
+                        _MEMORY_SEARCH_MEMORY_PRESENT: current is not None,
+                        _MEMORY_SEARCH_RESULT_COUNT: len(memory_hits),
+                    }
+                    if search_mode is not None:
+                        attributes[_MEMORY_SEARCH_MODE] = search_mode
+                    span.set_attributes(attributes)
+
+            experience_recall = self._runtime._experience_recall
+            with self._runtime._stage(
+                "experience.search",
+                attributes={
+                    "powercontext.experience.search.configured": experience_recall is not None,
+                    "powercontext.experience.search.limit": builder.experience_candidate_limit,
+                },
+            ) as span:
+                experience_hits = (
+                    ()
+                    if experience_recall is None
+                    else await experience_recall(
+                        self.scope_id,
+                        request.query,
+                        builder.experience_candidate_limit,
+                    )
                 )
-                memory_hits = result.hits
-            experience_hits = (
-                ()
-                if self._runtime._experience_recall is None
-                else await self._runtime._experience_recall(
-                    self.scope_id,
-                    request.query,
-                    builder.experience_candidate_limit,
+                if span is not None:
+                    span.set_attributes({"powercontext.experience.search.result_count": len(experience_hits)})
+
+            with self._runtime._stage(
+                "context.build",
+                attributes={
+                    "powercontext.context.build.memory_candidate_count": len(memory_hits),
+                    "powercontext.context.build.experience_candidate_count": len(experience_hits),
+                },
+            ) as span:
+                build = builder.build_result(
+                    request=request,
+                    memory_ref=None if current is None else current.as_ref(),
+                    hits=memory_hits,
+                    experience_hits=experience_hits,
                 )
-            )
-            build = builder.build_result(
-                request=request,
-                memory_ref=None if current is None else current.as_ref(),
-                hits=memory_hits,
-                experience_hits=experience_hits,
-            )
+                if span is not None:
+                    span.set_attributes({
+                        "powercontext.context.build.selected_count": len(build.origins),
+                        "powercontext.context.build.status": build.context.status,
+                        "powercontext.context.build.content_bytes": build.context.content_bytes,
+                    })
         if self._runtime._recall_token_estimator is not None:
             try:
                 measurement = await self._runtime._recall_token_estimator(self.scope_id, build)
@@ -321,7 +435,7 @@ class ScopedExperienceApplication:
         self.scope_id = validate_scope_id(scope_id)
 
     async def propose(self, request: ProposeExperienceRequest, /) -> ExperienceCandidate:
-        async with self._runtime._scoped_operation(self.scope_id), self._runtime._lock(self.scope_id):
+        async with self._runtime._scoped_operation(self.scope_id), self._runtime._locked(self.scope_id):
             service = self._runtime._review(self.scope_id)
             return await service.propose_experience(
                 request.proposal,
@@ -337,7 +451,7 @@ class ScopedExperienceApplication:
                 self.scope_id,
                 generation_purpose=ModelUsagePurpose.EXPERIENCE_GENERATION,
             ),
-            self._runtime._lock(self.scope_id),
+            self._runtime._locked(self.scope_id),
         ):
             return await self._runtime._generation(self.scope_id).experience(
                 sources=request.sources,
@@ -364,7 +478,7 @@ class ScopedExperienceApplication:
                 self.scope_id,
                 generation_purpose=ModelUsagePurpose.EXPERIENCE_GENERATION,
             ),
-            self._runtime._lock(self.scope_id),
+            self._runtime._locked(self.scope_id),
         ):
             return await incubator(self.scope_id, window_limit)
 
@@ -387,7 +501,7 @@ class ScopedSkillApplication:
         self.scope_id = validate_scope_id(scope_id)
 
     async def propose(self, request: ProposeSkillRequest, /) -> SkillCandidate:
-        async with self._runtime._scoped_operation(self.scope_id), self._runtime._lock(self.scope_id):
+        async with self._runtime._scoped_operation(self.scope_id), self._runtime._locked(self.scope_id):
             service = self._runtime._review(self.scope_id)
             return await service.propose_skill(
                 request.proposal,
@@ -403,7 +517,7 @@ class ScopedSkillApplication:
                 self.scope_id,
                 generation_purpose=ModelUsagePurpose.SKILL_GENERATION,
             ),
-            self._runtime._lock(self.scope_id),
+            self._runtime._locked(self.scope_id),
         ):
             return await self._runtime._generation(self.scope_id).skill(
                 origin=request.origin,
@@ -454,7 +568,7 @@ class ScopedHandoffApplication:
             return await context.artifacts.handoff.finalize(draft)
 
     async def commit(self, prepared: PreparedHandoff, /) -> Handoff:
-        async with self._runtime._context(self.scope_id) as context, self._runtime._lock(self.scope_id):
+        async with self._runtime._context(self.scope_id) as context, self._runtime._locked(self.scope_id):
             return await context.artifacts.handoff.commit(prepared)
 
     async def continue_from(
@@ -481,6 +595,12 @@ class ScopedHandoffApplication:
         async with self._runtime._context(self.scope_id) as context:
             return await context.artifacts.handoff.revisions()
 
+    async def validate_evidence(self, citations: tuple[HandoffCitation, ...], /) -> None:
+        """Validate exact same-scope evidence for a higher-level Work record."""
+
+        async with self._runtime._context(self.scope_id) as context:
+            await context.artifacts.handoff.validate_evidence(citations)
+
     @staticmethod
     def render(
         handoff: HandoffDraft | PreparedHandoff | Handoff,
@@ -501,6 +621,126 @@ class HandoffApplication:
         return ScopedHandoffApplication(self._runtime, scope_id)
 
 
+class ScopedWorkApplication:
+    """Orchestrate the minimal Delegation, Handoff, Continue, and Outcome loop."""
+
+    def __init__(self, runtime: BuiltinRuntime, scope_id: str) -> None:
+        self._runtime = runtime
+        self.scope_id = validate_scope_id(scope_id)
+
+    async def create_contract(self, request: CreateWorkContract, /) -> WorkSourceReceipt:
+        await self._validate(_contract_evidence(request.contract))
+        return await self._capture(WORK_CONTRACT_SOURCE_KIND, request.source_id, request.contract)
+
+    async def continuity(self, selected_handoff: ArtifactRef | None = None) -> WorkContinuity:
+        """Read a bounded timeline and loop coverage from the scoped Source journal."""
+
+        async with self._runtime._context(self.scope_id) as context:
+            entries = await context.sources.journal.entries()
+            if selected_handoff is None:
+                latest = await context.artifacts.handoff.latest()
+                selected_handoff = None if latest is None else latest.as_ref()
+        return project_work_continuity(self.scope_id, entries, selected_handoff=selected_handoff)
+
+    async def record_outcome(self, request: RecordTaskOutcome, /) -> WorkSourceReceipt:
+        await self._validate(_outcome_evidence(request.outcome))
+        if request.outcome.handoff_receipt_ref is not None:
+            await self._validate_outcome_receipt(request.outcome.handoff_receipt_ref)
+        return await self._capture(TASK_OUTCOME_SOURCE_KIND, request.source_id, request.outcome)
+
+    async def handoff_current(self, request: HandoffCurrentWork, /) -> PreparedWorkHandoff:
+        await self._validate(_claims_evidence((*request.handoff.state, request.handoff.next_action)))
+        boundary = await self._capture(HANDOFF_BOUNDARY_SOURCE_KIND, request.source_id, request.handoff)
+        boundary_citation = HandoffSourceCitation(source_ref=boundary.source_ref)
+        draft = HandoffDraft(
+            objective=request.handoff.objective,
+            state=tuple(_handoff_statement(claim, boundary_citation) for claim in request.handoff.state),
+            disposition=request.handoff.disposition,
+            next_action=(
+                None
+                if request.handoff.next_action is None
+                else _handoff_statement(request.handoff.next_action, boundary_citation)
+            ),
+            omissions=tuple(HandoffOmission(text=text) for text in request.handoff.omissions),
+        )
+        prepared = await self._runtime.handoff.for_scope(self.scope_id).finalize(draft)
+        return PreparedWorkHandoff(boundary=boundary, handoff=prepared)
+
+    async def acknowledge(self, request: AcknowledgeHandoff, /) -> HandoffAcknowledgement:
+        handoff = self._runtime.handoff.for_scope(self.scope_id)
+        if request.selection == "prepared":
+            if request.prepared is None:
+                raise InvalidRuntimeRequestError("handoff-selection")
+            resolution = await handoff.continue_from(request.prepared)
+        else:
+            if request.revision is None:
+                raise InvalidRuntimeRequestError("handoff-selection")
+            resolution = await handoff.continue_from(request.revision)
+        if resolution.status == "empty":
+            raise InvalidRuntimeRequestError("handoff-empty")
+
+        unavailable = _unavailable_evidence(resolution)
+        if request.status == "accepted" and unavailable:
+            raise InvalidRuntimeRequestError("handoff-evidence-unavailable")
+        receipt_record = HandoffReceipt(
+            receiver=request.receiver,
+            status=request.status,
+            selection=request.selection,
+            selected_revision=resolution.selected_revision,
+            prepared_digest=(None if request.prepared is None else content_digest(request.prepared)),
+            receiver_checks=request.receiver_checks,
+            evidence_status="unavailable" if unavailable else "available",
+            unavailable_evidence=unavailable,
+            message=request.message,
+        )
+        receipt = await self._capture(HANDOFF_RECEIPT_SOURCE_KIND, request.source_id, receipt_record)
+        return HandoffAcknowledgement(resolution=resolution, receipt=receipt)
+
+    async def _validate_outcome_receipt(self, receipt_ref: SourceRef) -> None:
+        async with self._runtime._context(self.scope_id) as context:
+            entries = await context.sources.journal.entries()
+        matching_entry = next((entry for entry in entries if entry.source_ref == receipt_ref), None)
+        if matching_entry is None or not isinstance(matching_entry.source, ContentSource):
+            raise InvalidRuntimeRequestError("task-outcome-handoff-receipt")
+        if matching_entry.source.metadata.get("kind") != HANDOFF_RECEIPT_SOURCE_KIND:
+            raise InvalidRuntimeRequestError("task-outcome-handoff-receipt")
+        try:
+            receipt = HandoffReceipt.model_validate_json(matching_entry.source.content)
+        except ValidationError as error:
+            raise InvalidRuntimeRequestError("task-outcome-handoff-receipt") from error
+        if receipt.status != "accepted" or receipt.selection != "exact" or receipt.selected_revision is None:
+            raise InvalidRuntimeRequestError("task-outcome-handoff-receipt")
+
+    async def _validate(self, citations: tuple[HandoffCitation, ...]) -> None:
+        if citations:
+            await self._runtime.handoff.for_scope(self.scope_id).validate_evidence(citations)
+
+    async def _capture(self, kind: WorkSourceKind, source_id: str, value: BaseModel) -> WorkSourceReceipt:
+        receipt = await self._runtime.sources.for_scope(self.scope_id).capture(
+            CaptureSource(
+                source_id=source_id,
+                content=value.model_dump_json(by_alias=True, exclude_none=False, indent=2),
+                metadata={"kind": kind, "schema": value.model_dump(by_alias=True)["schema"]},
+            )
+        )
+        return WorkSourceReceipt(
+            kind=kind,
+            source_ref=receipt.source_ref,
+            position=receipt.sequence,
+            content_digest=content_digest(value),
+        )
+
+
+class WorkApplication:
+    """Select the high-level Work application for one stable scope."""
+
+    def __init__(self, runtime: BuiltinRuntime) -> None:
+        self._runtime = runtime
+
+    def for_scope(self, scope_id: str, /) -> ScopedWorkApplication:
+        return ScopedWorkApplication(self._runtime, scope_id)
+
+
 class ScopedExternalSkillApplication:
     """Discover and exactly resolve Agent-native Skills in one local scope."""
 
@@ -509,7 +749,7 @@ class ScopedExternalSkillApplication:
         self.scope_id = validate_scope_id(scope_id)
 
     async def scan(self) -> ExternalSkillScanResult:
-        async with self._runtime._scoped_operation(self.scope_id), self._runtime._lock(self.scope_id):
+        async with self._runtime._scoped_operation(self.scope_id), self._runtime._locked(self.scope_id):
             return await self._runtime._external_skills(self.scope_id).scan()
 
     async def list(self, request: ListExternalSkillsRequest, /) -> ExternalSkillList:
@@ -534,7 +774,7 @@ class ScopedExternalSkillApplication:
                 self.scope_id,
                 generation_purpose=ModelUsagePurpose.SKILL_GENERATION,
             ),
-            self._runtime._lock(self.scope_id),
+            self._runtime._locked(self.scope_id),
         ):
             return await importer(
                 self.scope_id,
@@ -576,14 +816,14 @@ class ScopedReviewApplication:
             return await self._runtime._review(self.scope_id).get_candidate(request.candidate_id)
 
     async def approve(self, request: ApproveArtifactCandidateRequest, /) -> ReviewedCandidate:
-        async with self._runtime._scoped_operation(self.scope_id), self._runtime._lock(self.scope_id):
+        async with self._runtime._scoped_operation(self.scope_id), self._runtime._locked(self.scope_id):
             return await self._runtime._review(self.scope_id).approve(
                 request.candidate_id,
                 request.expected_version,
             )
 
     async def reject(self, request: RejectArtifactCandidateRequest, /) -> ReviewedCandidate:
-        async with self._runtime._scoped_operation(self.scope_id), self._runtime._lock(self.scope_id):
+        async with self._runtime._scoped_operation(self.scope_id), self._runtime._locked(self.scope_id):
             return await self._runtime._review(self.scope_id).reject(
                 request.candidate_id,
                 request.expected_version,
@@ -591,7 +831,7 @@ class ScopedReviewApplication:
             )
 
     async def revise(self, request: ReviseArtifactCandidateRequest, /) -> ReviewedCandidate:
-        async with self._runtime._scoped_operation(self.scope_id), self._runtime._lock(self.scope_id):
+        async with self._runtime._scoped_operation(self.scope_id), self._runtime._locked(self.scope_id):
             return await self._runtime._review(self.scope_id).revise(
                 request.candidate_id,
                 request.expected_version,
@@ -625,7 +865,7 @@ class ScopedMemoryApplication:
             self.scope_id,
             embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
         ) as context:
-            async with self._runtime._lock(self.scope_id):
+            async with self._runtime._locked(self.scope_id):
                 service = context.artifacts.memory
                 current = await _head_or_none(service, context.artifacts.memory_artifact_id)
                 _validate_expected_revision(current, request.expected_revision)
@@ -648,22 +888,51 @@ class ScopedMemoryApplication:
             generation_purpose=ModelUsagePurpose.MEMORY_RECALL,
             embedding_purpose=ModelUsagePurpose.MEMORY_RECALL,
         ) as context:
-            service = context.artifacts.memory
-            current = await _head_or_none(service, context.artifacts.memory_artifact_id)
-            if current is None:
-                return MemorySearchPage(memory_ref=None, mode=None)
-            result = await service.search(
-                request.query,
-                memories=(current,),
-                limit=request.limit,
-                mode=request.mode,
-            )
-            return MemorySearchPage(
-                memory_ref=current.as_ref(),
-                mode=result.mode,
-                hits=result.hits,
-                rerank=result.rerank,
-            )
+            with self._runtime._stage(
+                _MEMORY_SEARCH_STAGE,
+                attributes={
+                    _MEMORY_SEARCH_REQUESTED_MODE: request.mode,
+                    _MEMORY_SEARCH_LIMIT: request.limit,
+                },
+            ) as span:
+                service = context.artifacts.memory
+                attempt = 1
+                while True:
+                    current = await _head_or_none(service, context.artifacts.memory_artifact_id)
+                    if current is None:
+                        if span is not None:
+                            span.set_attributes({
+                                _MEMORY_SEARCH_MEMORY_PRESENT: False,
+                                _MEMORY_SEARCH_RESULT_COUNT: 0,
+                            })
+                        return MemorySearchPage(memory_ref=None, mode=None)
+                    try:
+                        result = await service.search(
+                            request.query,
+                            memories=(current,),
+                            limit=request.limit,
+                            mode=request.mode,
+                        )
+                    except (CapabilityNotSupportedError, InvalidMemoryCitationError) as error:
+                        latest = await _head_or_none(service, context.artifacts.memory_artifact_id)
+                        if not _is_stale_memory_search(error) or latest is None or latest.as_ref() == current.as_ref():
+                            raise
+                        if attempt == _MEMORY_SEARCH_ATTEMPTS:
+                            raise RevisionConflictError(current, latest) from error
+                        attempt += 1
+                        continue
+                    if span is not None:
+                        span.set_attributes({
+                            _MEMORY_SEARCH_MEMORY_PRESENT: True,
+                            _MEMORY_SEARCH_MODE: result.mode,
+                            _MEMORY_SEARCH_RESULT_COUNT: len(result.hits),
+                        })
+                    return MemorySearchPage(
+                        memory_ref=current.as_ref(),
+                        mode=result.mode,
+                        hits=result.hits,
+                        rerank=result.rerank,
+                    )
 
     async def list(self, *, include_inactive: bool = False) -> MemoryEntriesPage:
         async with self._runtime._context(self.scope_id) as context:
@@ -692,7 +961,7 @@ class ScopedMemoryApplication:
             self.scope_id,
             embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
         ) as context:
-            async with self._runtime._lock(self.scope_id):
+            async with self._runtime._locked(self.scope_id):
                 service = context.artifacts.memory
                 current, entry = await _current_citation(
                     service,
@@ -725,7 +994,7 @@ class ScopedMemoryApplication:
             self.scope_id,
             embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
         ) as context:
-            async with self._runtime._lock(self.scope_id):
+            async with self._runtime._locked(self.scope_id):
                 service = context.artifacts.memory
                 current, entry = await _current_citation(
                     service,
@@ -760,7 +1029,7 @@ class ScopedMemoryApplication:
             embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
         ) as context:
             window_limit = self._runtime.source_window_limit if limit is None else limit
-            async with self._runtime._lock(self.scope_id):
+            async with self._runtime._locked(self.scope_id):
                 return await context.triggers.flush(limit=window_limit)
 
     async def cursor(self) -> SourceCursor:
@@ -907,7 +1176,9 @@ class BuiltinRuntime:
         external_skill_importer: ExternalSkillImporter | None = None,
         statistics_service: StatisticsServiceFactory | None = None,
         recall_token_estimator: RecallTokenEstimator | None = None,
+        readiness: RuntimeReadinessChecks | None = None,
         clock: Clock | None = None,
+        tracing: RuntimeTracing | None = None,
     ) -> None:
         if source_window_limit < 1:
             raise _RuntimeConfigurationError("source_window_limit")
@@ -921,7 +1192,9 @@ class BuiltinRuntime:
         self._external_skill_importer = external_skill_importer
         self._statistics_service = statistics_service
         self._recall_token_estimator = recall_token_estimator
+        self._readiness = RuntimeReadinessChecks() if readiness is None else readiness
         self._clock = _utc_now if clock is None else clock
+        self._tracing = tracing
         self.source_window_limit = source_window_limit
         self._locks: dict[str, asyncio.Lock] = {}
         self._processor_lock = asyncio.Lock()
@@ -937,6 +1210,7 @@ class BuiltinRuntime:
         self.experience = ExperienceApplication(self)
         self.external_skills = ExternalSkillApplication(self)
         self.handoff = HandoffApplication(self)
+        self.work = WorkApplication(self)
         self.memory = MemoryApplication(self)
         self.review = ReviewApplication(self)
         self.skill = SkillApplication(self)
@@ -956,6 +1230,16 @@ class BuiltinRuntime:
     async def capabilities(self) -> RuntimeCapabilities:
         async with self._operation():
             return self._capabilities
+
+    async def readiness(self) -> RuntimeReadiness:
+        """Check whether the Runtime and its assembled dependencies can accept work."""
+
+        async with self._operation():
+            dependencies = await self._readiness.run()
+        return RuntimeReadiness(
+            status=dependencies.status,
+            checks={"runtime": ReadinessCheckStatus.READY, **dependencies.checks},
+        )
 
     def start_scheduler(
         self,
@@ -1092,10 +1376,36 @@ class BuiltinRuntime:
             generation_purpose=generation_purpose,
             embedding_purpose=embedding_purpose,
         ):
-            yield await self._provider.get(validate_scope_id(scope_id))
+            # The stage covers provider resolution only; a third-party provider may do I/O here.
+            with self._stage("scope.context", attributes={}):
+                context = await self._provider.get(validate_scope_id(scope_id))
+            yield context
 
-    def _lock(self, scope_id: str) -> asyncio.Lock:
-        return self._locks.setdefault(validate_scope_id(scope_id), asyncio.Lock())
+    @asynccontextmanager
+    async def _locked(self, scope_id: str) -> AsyncIterator[None]:
+        """Serialize writes for one scope and trace only the wait, not the critical section."""
+
+        lock = self._locks.setdefault(validate_scope_id(scope_id), asyncio.Lock())
+        acquired = False
+        try:
+            # Injected tracing must never leak the lock, so the release is armed before the stage is closed.
+            with self._stage("scope.lock", attributes={"powercontext.scope.lock.contended": lock.locked()}):
+                await lock.acquire()
+                acquired = True
+            yield
+        finally:
+            if acquired:
+                lock.release()
+
+    def _stage(
+        self,
+        name: str,
+        *,
+        attributes: Mapping[str, TraceAttribute],
+    ) -> AbstractContextManager[RuntimeSpan | None]:
+        if self._tracing is None:
+            return nullcontext(None)
+        return self._tracing.stage(name, attributes=attributes)
 
     def _review(self, scope_id: str) -> ReviewService:
         if self._review_service is None:
@@ -1118,6 +1428,42 @@ class BuiltinRuntime:
         return self._statistics_service(validate_scope_id(scope_id))
 
 
+def _contract_evidence(contract: WorkContract) -> tuple[HandoffCitation, ...]:
+    return _claims_evidence(contract.facts)
+
+
+def _outcome_evidence(outcome: TaskOutcome) -> tuple[HandoffCitation, ...]:
+    citations = [*_claims_evidence(outcome.observations)]
+    citations.extend(citation for check in outcome.checks for citation in check.evidence)
+    citations.extend(HandoffArtifactCitation(artifact_ref=reference) for reference in outcome.produced_artifacts)
+    return _unique_citations(citations)
+
+
+def _claims_evidence(claims: tuple[WorkClaim | None, ...]) -> tuple[HandoffCitation, ...]:
+    return _unique_citations(citation for claim in claims if claim is not None for citation in claim.evidence)
+
+
+def _unique_citations(citations: Iterable[HandoffCitation]) -> tuple[HandoffCitation, ...]:
+    unique: list[HandoffCitation] = []
+    for citation in citations:
+        if citation not in unique:
+            unique.append(citation)
+    return tuple(unique)
+
+
+def _handoff_statement(claim: WorkClaim, boundary: HandoffSourceCitation) -> HandoffStatement:
+    return HandoffStatement(
+        text=claim.text,
+        citations=_unique_citations((boundary, *claim.evidence)),
+    )
+
+
+def _unavailable_evidence(resolution: HandoffResolution) -> tuple[HandoffCitation, ...]:
+    return _unique_citations(
+        citation for check in resolution.evidence_checks for citation in check.unavailable_evidence
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -1127,6 +1473,12 @@ async def _head_or_none(service: MemoryService, artifact_id: str) -> Memory | No
         return await service.head(artifact_id)
     except ArtifactNotFoundError:
         return None
+
+
+def _is_stale_memory_search(error: CapabilityNotSupportedError | InvalidMemoryCitationError) -> bool:
+    return (isinstance(error, CapabilityNotSupportedError) and error.capability == "head") or (
+        isinstance(error, InvalidMemoryCitationError) and error.code == "memory-mismatch"
+    )
 
 
 def _validate_expected_revision(memory: Memory | None, expected_revision: int | None) -> None:
