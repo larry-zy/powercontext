@@ -222,6 +222,59 @@ def test_recall_completes_graph_for_over_limit_prompt(tmp_path: Path) -> None:
     _run(app, scenario)
 
 
+def test_recall_isolates_cached_context_across_scopes(tmp_path: Path) -> None:
+    # Regression for the multi-tenant case: one shared PowerContextRecall serves many runs. Two runs carrying the same
+    # human turn (identical id and text) but different scopes must each receive only their own scope's context. If the
+    # per-turn cache keyed on the turn alone, the first scope's prepared content would be replayed to the second.
+    scope_alpha = "project:tenant-alpha"
+    scope_bravo = "project:tenant-bravo"
+    marker_alpha = "ALPHA_SECRET_RUNBOOK"
+    marker_bravo = "BRAVO_SECRET_RUNBOOK"
+    turn = HumanMessage(content="How do we deploy the database migrations?", id="shared-turn")
+
+    model = _RecordingModel()
+    # A single hook instance is reused across both invocations, exercising the shared-instance cache path.
+    agent = create_react_agent(
+        model,
+        tools=[],
+        pre_model_hook=PowerContextRecall(),
+        context_schema=PowerContextScope,
+    )
+    app = _server_app(tmp_path)
+
+    async def scenario(client: PowerContextClient) -> None:
+        await client.remember_memory(
+            RememberMemoryRequest(
+                scope_id=scope_alpha,
+                kind="decision",
+                text=f"Deploy database migrations before rollout. {marker_alpha}",
+                reason="seeded for the isolation test",
+            )
+        )
+        await client.remember_memory(
+            RememberMemoryRequest(
+                scope_id=scope_bravo,
+                kind="decision",
+                text=f"Deploy database migrations before rollout. {marker_bravo}",
+                reason="seeded for the isolation test",
+            )
+        )
+
+        await agent.ainvoke({"messages": [turn]}, context=PowerContextScope(scope_id=scope_alpha))
+        alpha_systems = "\n".join(_system_texts(model.inputs[-1]))
+
+        await agent.ainvoke({"messages": [turn]}, context=PowerContextScope(scope_id=scope_bravo))
+        bravo_systems = "\n".join(_system_texts(model.inputs[-1]))
+
+        # Each run sees only its own tenant's memory; the shared cache never leaks one scope's content to the other.
+        assert marker_alpha in alpha_systems
+        assert marker_bravo not in alpha_systems
+        assert marker_bravo in bravo_systems
+        assert marker_alpha not in bravo_systems
+
+    _run(app, scenario)
+
+
 def test_agent_reaches_end_when_server_unreachable() -> None:
     model = _RecordingModel()
     agent = _build_agent(model)

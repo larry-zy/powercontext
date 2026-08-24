@@ -52,8 +52,8 @@ class _RememberInput(BaseModel):
 async def powercontext_search(query: str, limit: int = 5) -> str:
     """Search durable PowerContext memory for a question or topic."""
 
-    config = resolve_config(current_scope())
     try:
+        config = resolve_config(current_scope())
         request = SearchMemoryRequest(scope_id=config.scope_id, query=query[:_MAX_QUERY_CHARS], limit=limit)
         async with open_client(config) as client:
             response = await client.search_memory(request)
@@ -61,6 +61,8 @@ async def powercontext_search(query: str, limit: int = 5) -> str:
         return _invalid_arguments()
     except ClientError as exc:
         return _error(exc)
+    except Exception:
+        return _unavailable()
     if not response.hits:
         return "(no matching PowerContext memory)"
     return json.dumps(
@@ -81,8 +83,8 @@ async def powercontext_search(query: str, limit: int = 5) -> str:
 async def powercontext_remember(text: str, kind: str = "agent-note", reason: str | None = None) -> str:
     """Save one explicit durable memory for later agent sessions."""
 
-    config = resolve_config(current_scope())
     try:
+        config = resolve_config(current_scope())
         request = RememberMemoryRequest(scope_id=config.scope_id, kind=kind, text=text, reason=reason)
         async with open_client(config) as client:
             response = await client.remember_memory(request)
@@ -90,6 +92,8 @@ async def powercontext_remember(text: str, kind: str = "agent-note", reason: str
         return _invalid_arguments()
     except ClientError as exc:
         return _error(exc)
+    except Exception:
+        return _unavailable()
     if response.entry is None:
         return "(PowerContext accepted the memory without an entry receipt)"
     return f"Remembered {response.entry.kind}: {response.entry.text}"
@@ -99,8 +103,8 @@ async def powercontext_remember(text: str, kind: str = "agent-note", reason: str
 async def powercontext_context(query: str) -> str:
     """Prepare a bounded PowerContext payload for a new question."""
 
-    config = resolve_config(current_scope())
     try:
+        config = resolve_config(current_scope())
         request = PrepareContextRequest(
             scope_id=config.scope_id, query=query[:_MAX_QUERY_CHARS], max_bytes=config.max_bytes
         )
@@ -110,6 +114,8 @@ async def powercontext_context(query: str) -> str:
         return _invalid_arguments()
     except ClientError as exc:
         return _error(exc)
+    except Exception:
+        return _unavailable()
     return response.content or "(no relevant PowerContext context)"
 
 
@@ -127,3 +133,10 @@ def _invalid_arguments() -> str:
     # A model-supplied argument fell outside the public request contract (e.g. an empty or over-length field).
     # Report it as a tool result so the model can retry with corrected arguments rather than aborting the graph.
     return "(PowerContext rejected the request: an argument was empty or out of range)"
+
+
+def _unavailable() -> str:
+    # A configuration or unexpected fault (an unresolvable scope, a malformed base URL, or any other client error
+    # outside ClientError) prevented the call. Report it as a tool result so the model can proceed rather than
+    # aborting the graph.
+    return "(PowerContext unavailable: the request could not be completed)"

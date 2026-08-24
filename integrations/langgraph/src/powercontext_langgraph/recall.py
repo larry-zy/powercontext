@@ -69,6 +69,7 @@ class PowerContextRecall:
     def __init__(self, *, messages_key: str = "messages") -> None:
         self._messages_key = messages_key
         self._configuration_error_logged = False
+        self._config_failure_logged = False
         self._turn_cache: dict[str, str | None] = {}
 
     async def __call__(self, state: Any) -> dict[str, Any]:
@@ -87,7 +88,14 @@ class PowerContextRecall:
     async def _prepare_once(self, messages: list[BaseMessage], query: str) -> str | None:
         """Prepare context for the current human turn, reusing the result across the turn's model steps."""
 
-        config = resolve_config(current_scope())
+        try:
+            config = resolve_config(current_scope())
+        except Exception as exc:
+            # Config/scope resolution is part of the fail-open boundary: a malformed setting (ValidationError) or an
+            # unresolvable scope (MissingScopeError) must skip recall, not interrupt the graph. Logged once so a
+            # misconfigured deployment is diagnosable rather than silently context-free.
+            self._log_config_failure(exc)
+            return None
         key = _turn_key(config.scope_id, messages, query)
         if key is not None and key in self._turn_cache:
             return self._turn_cache[key]
@@ -117,6 +125,11 @@ class PowerContextRecall:
         except ClientError as exc:
             self._log_failure(exc)
             return None
+        except Exception:
+            # Recall is best-effort: a malformed base URL (httpx.InvalidURL is not a ClientError) or any other
+            # unexpected client fault must fail open rather than interrupt graph execution.
+            _LOGGER.debug("PowerContext recall skipped after an unexpected error.", exc_info=True)
+            return None
         if prepared.status == PreparedContextStatus.EMPTY:
             return None
         return prepared.content
@@ -134,6 +147,16 @@ class PowerContextRecall:
             )
         else:
             _LOGGER.debug("PowerContext recall skipped after %s.", type(exc).__name__)
+
+    def _log_config_failure(self, exc: Exception) -> None:
+        if not self._config_failure_logged:
+            self._config_failure_logged = True
+            _LOGGER.error(
+                "PowerContext recall skipped: configuration could not be resolved (%s). Set "
+                "POWERCONTEXT_LANGGRAPH_SCOPE_ID, pass PowerContextScope(scope_id=...), or correct the "
+                "POWERCONTEXT_LANGGRAPH_* settings.",
+                type(exc).__name__,
+            )
 
 
 def _messages(state: Any, key: str) -> list[BaseMessage]:

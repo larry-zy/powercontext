@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,7 +32,8 @@ class PowerContextLangGraphSettings(BaseSettings):
     )
 
     base_url: str = "http://127.0.0.1:8000"
-    token: str | None = None
+    # A bearer credential: typed SecretStr and hidden from reprs so it never surfaces in a traceback or trace.
+    token: SecretStr | None = Field(default=None, repr=False)
     scope_id: str | None = None
     timeout: float = 10.0
     max_bytes: int = Field(default=8000, ge=512, le=32768)

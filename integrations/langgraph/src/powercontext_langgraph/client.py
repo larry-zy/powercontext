@@ -19,9 +19,10 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
+from pydantic import SecretStr
 
 from powercontext.client import PowerContextClient
 
@@ -41,7 +42,9 @@ class ResolvedConfig:
 
     base_url: str
     scope_id: str
-    token: str | None
+    # Plain bearer token forwarded to the client for the ``Authorization`` header; hidden from the repr so it never
+    # surfaces in a traceback or trace of the resolved configuration.
+    token: str | None = field(repr=False)
     timeout: float
     max_bytes: int
 
@@ -55,13 +58,20 @@ def resolve_config(
 
     resolved_settings = settings or PowerContextLangGraphSettings()
     scope = scope or PowerContextScope()
+    # The scope token is a plain str; the settings token is a SecretStr. Unwrap to a plain str at this boundary so the
+    # client can compose the ``Authorization`` header, while the stored settings/scope fields stay repr-safe.
+    token = scope.token if scope.token is not None else _secret_value(resolved_settings.token)
     return ResolvedConfig(
         base_url=(scope.base_url or resolved_settings.base_url).strip(),
         scope_id=resolve_scope_id(scope.scope_id or resolved_settings.scope_id),
-        token=scope.token if scope.token is not None else resolved_settings.token,
+        token=token,
         timeout=scope.timeout if scope.timeout is not None else resolved_settings.timeout,
         max_bytes=resolved_settings.max_bytes,
     )
+
+
+def _secret_value(secret: SecretStr | None) -> str | None:
+    return secret.get_secret_value() if secret is not None else None
 
 
 def open_client(config: ResolvedConfig) -> PowerContextClient:

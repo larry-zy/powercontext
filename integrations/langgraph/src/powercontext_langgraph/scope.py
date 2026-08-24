@@ -28,7 +28,7 @@ import hashlib
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from shutil import which
 from urllib.parse import urlsplit
 
@@ -52,7 +52,9 @@ class PowerContextScope:
 
     scope_id: str | None = None
     base_url: str | None = None
-    token: str | None = None
+    # A bearer credential passed through the graph ``context``; hidden from the dataclass repr so it never surfaces
+    # in a traceback or trace of the run context. Kept a plain ``str`` for ergonomic ``PowerContextScope(token=...)``.
+    token: str | None = field(default=None, repr=False)
     timeout: float | None = None
 
 
