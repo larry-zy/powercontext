@@ -61,7 +61,7 @@ readiness endpoint 仍然公开。明文 HTTP 仅在 loopback 地址（`127.0.0.
 显式设置 `POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true` 主动选择接受。通过网络暴露启用鉴权的
 Server 前必须配置 TLS。
 
-Python Client 和 CLI 对出站请求应用相同规则：明文 `http://` 的 Server URL 仅接受 loopback 主机，并且 Client 拒绝
+Python Client 和 CLI 对出站请求应用相同规则：配置的明文 `http://` Server URL 仅接受 loopback 主机，并且 Client 拒绝
 通过明文的非 loopback 连接发送 Bearer token。
 
 Dashboard 默认启用，并与 HTTP API、MCP 共用监听地址和端口。默认未配置 scope，页面会显示空状态；Dashboard

@@ -62,8 +62,9 @@ while authentication is disabled; either enable authentication, keep the bind on
 upstream or the network is otherwise controlled, set `POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true` to
 opt in explicitly. Use TLS before exposing an authenticated Server over a network.
 
-The Python Client and CLI apply the matching rule for outbound requests: an unencrypted `http://` Server URL is accepted
-only for loopback hosts, and the Client refuses to send a bearer token over an unencrypted non-loopback connection.
+The Python Client and CLI apply the matching rule for outbound requests: a configured unencrypted `http://` Server URL is
+accepted only for loopback hosts, and the Client refuses to send a bearer token over an unencrypted non-loopback
+connection.
 
 The Dashboard is enabled by default and shares the Server listener and port with the HTTP API and MCP. With no scopes
 configured, the page shows an empty state. Dashboard initialization failures are logged with their direct cause and do

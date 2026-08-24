@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared network transport-policy contract across Client, CLI, and Server."""
+"""Shared network transport-policy contract across Client, CLI, Server, and the Codex plugin."""
 
 from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+from types import ModuleType
 
 import httpx
 import pytest
@@ -23,9 +27,32 @@ from pydantic import SecretStr, ValidationError
 from powercontext.client import PowerContextClient
 from powercontext.client.settings import ClientSettings
 from powercontext.server.settings import BearerAuthConfig, HttpConfig, ServerSettings
-from powercontext.transport import is_loopback_host, is_plaintext_non_loopback
+from powercontext.transport import LOOPBACK_HOSTS, is_loopback_host, is_plaintext_non_loopback
 
 _ALL_INTERFACES = "0.0.0.0"  # noqa: S104 - a non-loopback bind used to exercise the policy.
+
+# The Codex plugin ships as an isolated package (it only depends on pydantic-settings) and cannot
+# import powercontext, so it keeps its own copy of the loopback policy. Load it by path to pin that
+# copy to the shared contract and catch drift the two implementations could otherwise hide.
+_CODEX_SETTINGS_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "integrations"
+    / "codex"
+    / "plugins"
+    / "powercontext"
+    / "settings.py"
+)
+
+
+def _load_codex_settings() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("codex_plugin_settings", _CODEX_SETTINGS_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_CODEX_SETTINGS = _load_codex_settings()
 
 
 @pytest.mark.parametrize(
@@ -91,10 +118,8 @@ def test_client_allows_an_unauthenticated_non_loopback_transport() -> None:
 def test_server_rejects_an_unauthenticated_non_loopback_bind() -> None:
     with pytest.raises(ValidationError):
         ServerSettings(
-            http={"host": _ALL_INTERFACES},
-            auth={"enabled": False},
-            mcp={"enabled": False},
-            dashboard={"enabled": False},
+            http=HttpConfig(host=_ALL_INTERFACES),
+            auth=BearerAuthConfig(enabled=False),
         )
 
 
@@ -113,3 +138,24 @@ def test_server_allows_a_non_loopback_bind_with_an_explicit_opt_in() -> None:
         allow_unauthenticated_non_loopback=True,
     )
     assert settings.allow_unauthenticated_non_loopback is True
+
+
+def test_codex_plugin_shares_the_loopback_host_set() -> None:
+    assert _CODEX_SETTINGS._LOOPBACK_HOSTS == LOOPBACK_HOSTS
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["127.0.0.1", "localhost", "[::1]", _ALL_INTERFACES, "memory.example", "192.168.1.10"],
+)
+def test_codex_plugin_matches_the_shared_plaintext_policy(host: str) -> None:
+    """The Codex plugin's own loopback check must agree with the shared transport contract."""
+
+    base_url = f"http://{host}:8000"
+    transport_rejects = is_plaintext_non_loopback(base_url)
+    try:
+        _CODEX_SETTINGS._http_base_url(f"{base_url}/mcp")
+        codex_rejects = False
+    except ValueError:
+        codex_rejects = True
+    assert codex_rejects == transport_rejects
