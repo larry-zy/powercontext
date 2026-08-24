@@ -1,3 +1,17 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Validated configuration for one built-in runtime instance."""
 
 from __future__ import annotations
@@ -10,6 +24,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from powercontext.builtin.artifacts.memory.prompts import MemoryExtractionProfile
 from powercontext.builtin.artifacts.skill import CodexSkillRoot
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
+from powercontext.builtin.persistence.seekdb import SeekDBConfig
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 
 
@@ -27,7 +42,7 @@ class RuntimeConfig(BaseModel):
 class HandoffReportConfig(BaseModel):
     """Optional Handoff Report feature registration."""
 
-    enabled: bool = False
+    enabled: bool = True
 
 
 class InferenceConfig(BaseModel):
@@ -95,7 +110,7 @@ class ExternalSkillsConfig(BaseModel):
         return self
 
 
-DatabaseConfig = SQLiteConfig | OceanBaseConfig
+DatabaseConfig = SQLiteConfig | OceanBaseConfig | SeekDBConfig
 
 
 def normalize_database_discriminator(value: Any) -> Any:

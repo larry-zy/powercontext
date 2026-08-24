@@ -1,3 +1,17 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Composition and lifecycle for one configured built-in runtime."""
 
 from __future__ import annotations
@@ -5,9 +19,10 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import JsonValue
+from typing_extensions import override
 
 from powercontext.builtin.artifacts.experience import ExperienceCandidatePipeline, ExperienceGenerator
 from powercontext.builtin.artifacts.handoff import (
@@ -18,10 +33,12 @@ from powercontext.builtin.artifacts.memory import (
     CandidatePipeline,
     DefaultMemoryEvidenceProjector,
     MemoryCapabilities,
+    MemoryHit,
+    MemoryRerankDecision,
     MemoryReranker,
 )
 from powercontext.builtin.artifacts.skill import CodexSkillProvider, ExternalSkillProvider, SkillGenerator
-from powercontext.builtin.handoff_report.adapters import RuntimeHandoffReadAdapter
+from powercontext.builtin.handoff_report.adapters import RuntimeHandoffReadAdapter, RuntimeWorkContinuityReadAdapter
 from powercontext.builtin.handoff_report.application import HandoffReportApplication
 from powercontext.builtin.handoff_report.sqlite import HANDOFF_REPORT_TABLES
 from powercontext.builtin.inference import EmbeddingModel, TokenEstimator, character_token_estimator
@@ -36,16 +53,29 @@ from powercontext.builtin.persistence.oceanbase.memory_index import (
     OceanBaseMemoryVectorIndex,
 )
 from powercontext.builtin.persistence.oceanbase.profile import OceanBaseConfig, OceanBaseProfile
+from powercontext.builtin.persistence.seekdb.profile import SeekDBConfig, SeekDBProfile
 from powercontext.builtin.persistence.sqlite.experience_index import SQLiteExperienceFTSIndex
-from powercontext.builtin.persistence.sqlite.memory_index import SQLiteMemoryFTSIndex, SQLiteMemoryVec1Index
+from powercontext.builtin.persistence.sqlite.memory_index import SQLiteMemoryFTSIndex, SQLiteMemoryVectorIndex
 from powercontext.builtin.persistence.sqlite.profile import SQLiteConfig, SQLiteProfile
 from powercontext.builtin.persistence.tables import BUILTIN_TABLES
 from powercontext.builtin.runtime.application import BuiltinRuntime
 from powercontext.builtin.runtime.config import BuiltinConfig, ExternalSkillsConfig, InferenceConfig, RuntimeConfig
 from powercontext.builtin.runtime.models import MemorySearchMode, RuntimeCapabilities
+from powercontext.builtin.runtime.protocols import RuntimeTracing
+from powercontext.builtin.runtime.readiness import (
+    READINESS_PROBE_TIMEOUT_SECONDS,
+    CachedReadinessProbe,
+    ReadinessProbe,
+    ReadinessProbeDefinition,
+    RuntimeReadinessChecks,
+    dependency_readiness_probe,
+)
 from powercontext.builtin.runtime.relational import RelationalContexts
 from powercontext.builtin.sources import CONTENT_SOURCE_NAME, ContentSource
 from powercontext.sources import Source
+
+if TYPE_CHECKING:
+    from pydantic_ai.models.instrumented import InstrumentationSettings
 
 ValueT = TypeVar("ValueT")
 
@@ -66,6 +96,7 @@ class BuiltinConfigurationError(RuntimeError):
 
 
 class _ContentEvidenceProjector(DefaultMemoryEvidenceProjector):
+    @override
     def project_source(self, source: Source, /) -> JsonValue:
         if isinstance(source, ContentSource):
             return {
@@ -78,6 +109,7 @@ class _ContentEvidenceProjector(DefaultMemoryEvidenceProjector):
 
 
 class _ContentHandoffEvidenceProjector(DefaultHandoffEvidenceProjector):
+    @override
     def project_source(self, source: Source, /) -> JsonValue:
         if isinstance(source, ContentSource):
             return {
@@ -87,6 +119,37 @@ class _ContentHandoffEvidenceProjector(DefaultHandoffEvidenceProjector):
                 "metadata": source.model_dump(mode="json")["metadata"],
             }
         return super().project_source(source)
+
+
+class _TracingMemoryReranker:
+    """Trace one configured reranker without exposing Memory content."""
+
+    def __init__(self, delegate: MemoryReranker, tracing: RuntimeTracing) -> None:
+        self._delegate = delegate
+        self._tracing = tracing
+        self.policy_id = delegate.policy_id
+
+    async def rerank(
+        self,
+        query: str,
+        candidates: tuple[MemoryHit, ...],
+        limit: int,
+        /,
+    ) -> MemoryRerankDecision:
+        with self._tracing.stage(
+            "memory.rerank",
+            attributes={
+                "powercontext.memory.rerank.candidate_count": len(candidates),
+                "powercontext.memory.rerank.limit": limit,
+            },
+        ) as span:
+            decision = await self._delegate.rerank(query, candidates, limit)
+            span.set_attributes({
+                "powercontext.memory.rerank.selected_count": len(decision.selected_ranks),
+                "powercontext.memory.rerank.discarded_rank_count": decision.discarded_rank_count,
+                "powercontext.memory.rerank.used_fallback": decision.used_fallback,
+            })
+            return decision
 
 
 @asynccontextmanager
@@ -103,6 +166,8 @@ async def open_builtin_runtime(
     embedding_model: EmbeddingModel | None = None,
     token_estimator: TokenEstimator | None = None,
     memory_reranker: MemoryReranker | None = None,
+    instrumentation: InstrumentationSettings | None = None,
+    tracing: RuntimeTracing | None = None,
 ) -> AsyncIterator[BuiltinRuntime]:
     """Open the selected database, inference adapters, and built-in runtime."""
 
@@ -114,8 +179,9 @@ async def open_builtin_runtime(
             generated_skill,
             generated_handoff,
             generated_reranker,
+            generation_readiness,
         ) = (
-            await _generation_pipelines(config.inference, config.runtime, resources)
+            await _generation_pipelines(config.inference, config.runtime, resources, instrumentation)
             if (
                 candidate_pipeline is None
                 or experience_pipeline is None
@@ -124,7 +190,7 @@ async def open_builtin_runtime(
                 or handoff_pipeline is None
                 or (config.runtime.memory_rerank_enabled and memory_reranker is None)
             )
-            else (None, None, None, None, None, None)
+            else (None, None, None, None, None, None, None)
         )
         configured_pipeline = generated_memory if candidate_pipeline is None else candidate_pipeline
         configured_incubation = generated_incubation if experience_pipeline is None else experience_pipeline
@@ -132,9 +198,23 @@ async def open_builtin_runtime(
         configured_skill = generated_skill if skill_generator is None else skill_generator
         configured_handoff = generated_handoff if handoff_pipeline is None else handoff_pipeline
         configured_reranker = generated_reranker if memory_reranker is None else memory_reranker
-        configured_embedding_source = (
-            await _embedding_model(config.inference, resources) if embedding_model is None else embedding_model
-        )
+        if configured_reranker is not None and tracing is not None:
+            configured_reranker = _TracingMemoryReranker(configured_reranker, tracing)
+        if embedding_model is None:
+            configured_embedding_source, readiness_embedding = await _embedding_models(
+                config.inference,
+                resources,
+                instrumentation,
+            )
+        else:
+            from powercontext.builtin.inference.pydantic_ai import PydanticAIEmbeddingModel
+
+            configured_embedding_source = embedding_model
+            readiness_embedding = (
+                embedding_model._without_instrumentation()
+                if isinstance(embedding_model, PydanticAIEmbeddingModel)
+                else embedding_model
+            )
         configured_embedding = (
             None if configured_embedding_source is None else UsageReportingEmbeddingModel(configured_embedding_source)
         )
@@ -157,6 +237,22 @@ async def open_builtin_runtime(
                 memory_reranker=configured_reranker,
             )
         )
+        readiness_probes: dict[str, ReadinessProbeDefinition] = {
+            "database": ReadinessProbeDefinition(
+                probe=dependency_readiness_probe(contexts.database.ping),
+                blocking=True,
+            ),
+        }
+        if generation_readiness is not None:
+            readiness_probes["inference.generation"] = ReadinessProbeDefinition(
+                probe=generation_readiness,
+                blocking=False,
+            )
+        if readiness_embedding is not None:
+            readiness_probes["inference.embedding"] = ReadinessProbeDefinition(
+                probe=_embedding_readiness_probe(readiness_embedding),
+                blocking=False,
+            )
         runtime = await resources.enter_async_context(
             BuiltinRuntime(
                 provider=contexts,
@@ -178,12 +274,15 @@ async def open_builtin_runtime(
                 external_skill_importer=contexts.import_external_skill if contexts.external_skill_registry else None,
                 statistics_service=contexts.statistics,
                 recall_token_estimator=contexts.estimate_recall_tokens,
+                readiness=RuntimeReadinessChecks(readiness_probes),
+                tracing=tracing,
             )
         )
         if config.handoff_report.enabled:
             runtime.handoff_report = HandoffReportApplication(
                 contexts.database,
                 RuntimeHandoffReadAdapter(runtime.handoff),
+                continuity=RuntimeWorkContinuityReadAdapter(runtime.work),
             )
         if config.runtime.schedule_seconds is not None and configured_pipeline is None:
             raise BuiltinConfigurationError("scheduled-pipeline")
@@ -222,14 +321,13 @@ async def open_builtin_contexts(
     if isinstance(database, SQLiteConfig):
         experience_index = SQLiteExperienceFTSIndex()
         indexes: list[MemoryIndex] = [SQLiteMemoryFTSIndex()]
-        if database.vec1_extension is not None:
-            if embedding_model is None:
-                raise ValueError("SQLite Vec1 requires an embedding model")  # noqa: TRY003
-            indexes.append(SQLiteMemoryVec1Index(database.vec1_extension, embedding_model.profile))
+        if embedding_model is not None:
+            indexes.append(SQLiteMemoryVectorIndex(embedding_model.profile))
         index = CompositeMemoryIndex(*indexes)
         async with SQLiteProfile.open(
             database,
             tables=BUILTIN_TABLES + report_tables + index.tables,
+            load_vector_extension=embedding_model is not None,
         ) as profile:
             async with profile.database.transaction() as connection:
                 await index.initialize(connection)
@@ -250,18 +348,19 @@ async def open_builtin_contexts(
                 memory_rerank_candidate_limit=config.runtime.memory_rerank_candidate_limit,
             )
         return
-    if not isinstance(database, OceanBaseConfig):
-        raise BuiltinConfigurationError("database")
-
     experience_index = OceanBaseExperienceFTSIndex()
     indexes = [OceanBaseMemoryFTSIndex()]
     if embedding_model is not None:
         indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
     index = CompositeMemoryIndex(*indexes)
-    async with OceanBaseProfile.open(
-        database,
-        tables=BUILTIN_TABLES + report_tables + index.tables,
-    ) as profile:
+    tables = BUILTIN_TABLES + report_tables + index.tables
+    if isinstance(database, OceanBaseConfig):
+        profile_context = OceanBaseProfile.open(database, tables=tables)
+    elif isinstance(database, SeekDBConfig):
+        profile_context = SeekDBProfile.open(database, tables=tables)
+    else:
+        raise BuiltinConfigurationError("database")
+    async with profile_context as profile:
         async with profile.database.transaction() as connection:
             await index.initialize(connection)
             await experience_index.initialize(connection)
@@ -286,6 +385,7 @@ async def _generation_pipelines(
     settings: InferenceConfig,
     runtime: RuntimeConfig,
     resources: AsyncExitStack,
+    instrumentation: InstrumentationSettings | None,
 ) -> tuple[
     CandidatePipeline | None,
     ExperienceCandidatePipeline | None,
@@ -293,11 +393,13 @@ async def _generation_pipelines(
     SkillGenerator | None,
     HandoffGenerationPipeline | None,
     MemoryReranker | None,
+    ReadinessProbe | None,
 ]:
     if settings.generation_model is None:
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     from pydantic_ai.models import infer_model
+    from pydantic_ai.models.instrumented import InstrumentedModel
     from pydantic_ai.settings import ModelSettings
 
     from powercontext.builtin.artifacts.experience import (
@@ -331,9 +433,19 @@ async def _generation_pipelines(
         LLMSkillGenerator,
         SkillGenerationOutput,
     )
-    from powercontext.builtin.inference.pydantic_ai import InferenceLimits, PydanticAIStructuredGenerator
+    from powercontext.builtin.inference.pydantic_ai import (
+        InferenceLimits,
+        PydanticAIStructuredGenerator,
+        probe_pydantic_ai_model,
+    )
 
-    model = await resources.enter_async_context(infer_model(settings.generation_model))
+    provider_model = await resources.enter_async_context(infer_model(settings.generation_model))
+    model = provider_model if instrumentation is None else InstrumentedModel(provider_model, instrumentation)
+
+    async def probe_generation() -> None:
+        # Readiness probing runs outside any operation span; keep it out of traces.
+        await probe_pydantic_ai_model(provider_model, timeout_seconds=READINESS_PROBE_TIMEOUT_SECONDS)
+
     limits = InferenceLimits(
         timeout_seconds=settings.generation_timeout_seconds,
         max_requests=settings.generation_max_requests,
@@ -344,6 +456,7 @@ async def _generation_pipelines(
         input_type=MemoryExtractionInput,
         output_type=MemoryExtractionOutput,
         limits=limits,
+        name="memory_extraction",
     )
     experience_generator = PydanticAIStructuredGenerator(
         model=model,
@@ -351,6 +464,7 @@ async def _generation_pipelines(
         input_type=ExperienceIncubationInput,
         output_type=ExperienceIncubationOutput,
         limits=limits,
+        name="experience_incubation",
     )
     explicit_experience_generator = PydanticAIStructuredGenerator(
         model=model,
@@ -358,6 +472,7 @@ async def _generation_pipelines(
         input_type=ArtifactGenerationInput,
         output_type=ExperienceGenerationOutput,
         limits=limits,
+        name="experience_generation",
     )
     skill_generator = PydanticAIStructuredGenerator(
         model=model,
@@ -365,6 +480,7 @@ async def _generation_pipelines(
         input_type=ArtifactGenerationInput,
         output_type=SkillGenerationOutput,
         limits=limits,
+        name="skill_generation",
     )
     handoff_generator = PydanticAIStructuredGenerator(
         model=model,
@@ -372,6 +488,7 @@ async def _generation_pipelines(
         input_type=HandoffGenerationInput,
         output_type=HandoffGenerationOutput,
         limits=limits,
+        name="handoff_generation",
     )
     rerank_generator = (
         PydanticAIStructuredGenerator(
@@ -381,6 +498,7 @@ async def _generation_pipelines(
             output_type=MemoryRerankOutput,
             limits=limits,
             model_settings=ModelSettings(temperature=0.0),
+            name="memory_rerank",
         )
         if runtime.memory_rerank_enabled
         else None
@@ -398,12 +516,17 @@ async def _generation_pipelines(
             evidence_projector=_ContentHandoffEvidenceProjector(),
         ),
         (None if rerank_generator is None else LLMMemoryReranker(UsageReportingStructuredGenerator(rerank_generator))),
+        CachedReadinessProbe(dependency_readiness_probe(probe_generation)),
     )
 
 
-async def _embedding_model(settings: InferenceConfig, resources: AsyncExitStack) -> EmbeddingModel | None:
+async def _embedding_models(
+    settings: InferenceConfig,
+    resources: AsyncExitStack,
+    instrumentation: InstrumentationSettings | None,
+) -> tuple[EmbeddingModel | None, EmbeddingModel | None]:
     if settings.embedding_model is None:
-        return None
+        return None, None
 
     from pydantic_ai import Embedder
     from pydantic_ai.embeddings import infer_embedding_model
@@ -422,18 +545,33 @@ async def _embedding_model(settings: InferenceConfig, resources: AsyncExitStack)
     model = infer_embedding_model(settings.embedding_model, provider_factory=provider_factory)
     for provider in providers:
         await resources.enter_async_context(provider)
-    return PydanticAIEmbeddingModel(
-        embedder=Embedder(model),
-        batch_size=settings.embedding_batch_size,
-        profile=EmbeddingProfile(
-            profile_id=_required(settings.embedding_profile_id),
-            model=settings.embedding_model,
-            dimension=_required(settings.embedding_dimension),
-            distance="l2",
-            normalization=settings.embedding_normalization,
-        ),
-        limits=InferenceLimits(timeout_seconds=settings.embedding_timeout_seconds),
+    profile = EmbeddingProfile(
+        profile_id=_required(settings.embedding_profile_id),
+        model=settings.embedding_model,
+        dimension=_required(settings.embedding_dimension),
+        distance="l2",
+        normalization=settings.embedding_normalization,
     )
+    limits = InferenceLimits(timeout_seconds=settings.embedding_timeout_seconds)
+
+    def adapter(instrument: InstrumentationSettings | bool | None) -> EmbeddingModel:
+        return PydanticAIEmbeddingModel(
+            embedder=Embedder(model, instrument=instrument),
+            batch_size=settings.embedding_batch_size,
+            profile=profile,
+            limits=limits,
+        )
+
+    # Readiness runs outside an application operation, so use the same provider model
+    # without instrumentation to avoid exporting an orphan inference span.
+    return adapter(instrumentation), adapter(False)
+
+
+def _embedding_readiness_probe(model: EmbeddingModel) -> ReadinessProbe:
+    async def probe_embedding() -> None:
+        await model.embed(("PowerContext readiness probe",))
+
+    return CachedReadinessProbe(dependency_readiness_probe(probe_embedding))
 
 
 def _required(value: ValueT | None) -> ValueT:

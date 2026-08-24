@@ -1,3 +1,17 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Minimal transport access logging for the ready-to-run Server."""
 
 from __future__ import annotations
@@ -9,6 +23,7 @@ from typing import Any
 
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from typing_extensions import override
 
 from powercontext._logging import log_safely
 from powercontext.server.context import current_request_id, is_internal_bridge
@@ -62,6 +77,7 @@ class HttpAccessLogMiddleware:
 class McpAccessLogMiddleware(Middleware):
     """Log logical MCP protocol requests instead of Streamable HTTP frames."""
 
+    @override
     async def on_request(
         self,
         context: MiddlewareContext[Any],

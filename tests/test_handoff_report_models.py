@@ -1,3 +1,17 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -126,7 +140,7 @@ def test_activity_event_validates_timestamp_basis_and_utc_observation() -> None:
     with pytest.raises(ValidationError, match="observed_at must be UTC"):
         _activity(observed_at=NOW.astimezone(timezone(timedelta(hours=8))))
     with pytest.raises(ValidationError, match="occurred_at must include a UTC offset"):
-        _activity(occurred_at=datetime(2026, 8, 5, 3, 0))
+        _activity(occurred_at=datetime(2026, 8, 5, 3, 0))  # noqa: DTZ001 - intentional invalid input
 
 
 def test_report_selection_entry_requires_exact_handoff_or_explicit_absence() -> None:

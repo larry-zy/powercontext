@@ -1,7 +1,22 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Ready-to-run Server composition over the built-in runtime."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -17,11 +32,12 @@ from powercontext.builtin.artifacts.handoff import HandoffGenerationPipeline
 from powercontext.builtin.artifacts.memory import CandidatePipeline
 from powercontext.builtin.artifacts.skill import ExternalSkillProvider, SkillGenerator
 from powercontext.builtin.inference import EmbeddingModel
+from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import BuiltinRuntime
 from powercontext.builtin.runtime.composition import open_builtin_runtime
 from powercontext.builtin.runtime.config import BuiltinConfig
 from powercontext.builtin.sources import CONTENT_SOURCE_NAME
-from powercontext.http import Capabilities, MemorySearchMode, PreparedContextSchema
+from powercontext.http import Capabilities, MemorySearchMode, PreparedContextSchema, ReadinessResponse, ReadinessStatus
 from powercontext.paths import default_scheduler_path
 from powercontext.server.access import HttpAccessLogMiddleware
 from powercontext.server.app import create_app
@@ -63,10 +79,13 @@ def create_server_app(
     resolved_tracing = ServerTracing.context_only() if tracing is None else tracing
     if metrics is not None:
         metrics.set_ready(False)
+    readiness_probe = _ServerReadinessProbe(metrics, tracing=resolved_tracing)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _log_lifecycle("server.starting", "PowerContext Server is starting")
+        if isinstance(config.database, SQLiteConfig) and config.database.is_in_memory:
+            _log_in_memory_database_warning()
         async with open_builtin_runtime(
             config,
             scheduler_path=default_scheduler_path() if scheduler_path is None else scheduler_path,
@@ -77,19 +96,19 @@ def create_server_app(
             external_skill_provider=external_skill_provider,
             handoff_pipeline=handoff_pipeline,
             embedding_model=embedding_model,
+            instrumentation=resolved_tracing.instrumentation,
+            tracing=resolved_tracing,
         ) as runtime:
+            readiness_probe.bind(runtime)
             app.state.application = runtime
             app.state.capabilities = await _server_capabilities(runtime)
-            if metrics is not None:
-                metrics.set_ready(True)
-            _log_lifecycle("server.ready", "PowerContext Server is ready")
+            await readiness_probe()
             try:
                 yield
             finally:
                 _log_lifecycle("server.stopping", "PowerContext Server is stopping")
+                readiness_probe.unbind()
                 app.state.application = None
-                if metrics is not None:
-                    metrics.set_ready(False)
                 app.state.capabilities = Capabilities(
                     source_types=[],
                     artifact_families=[],
@@ -113,17 +132,13 @@ def create_server_app(
 
     app = create_app(
         lifespan=lifespan,
+        readiness_probe=readiness_probe,
         middleware=configured_middleware,
         metrics=metrics,
         tracing=resolved_tracing,
         handoff_report_enabled=resolved.handoff_report.enabled,
     )
-    if resolved.dashboard.enabled:
-        mount_web_ui(
-            app,
-            scopes={scope.scope_id: scope.display_name for scope in resolved.dashboard.scopes},
-            handoff_report_enabled=resolved.handoff_report.enabled,
-        )
+    _mount_optional_web_ui(app, resolved)
     if metrics is not None:
         app.add_api_route(
             "/metrics",
@@ -159,12 +174,107 @@ def create_server_app(
     return app
 
 
+def _mount_optional_web_ui(app: FastAPI, settings: ServerSettings) -> None:
+    app.state.dashboard_started = False
+    app.state.dashboard_startup_error = None
+    if not (settings.dashboard.enabled or settings.handoff_report.enabled):
+        return
+    try:
+        mount_web_ui(
+            app,
+            scopes={scope.scope_id: scope.display_name for scope in settings.dashboard.scopes},
+            dashboard_enabled=settings.dashboard.enabled,
+            handoff_report_enabled=settings.handoff_report.enabled,
+            authentication_required=settings.auth.enabled,
+        )
+        if settings.dashboard.enabled:
+            app.state.dashboard_started = True
+    except Exception as error:
+        app.state.dashboard_startup_error = str(error)
+        unit = "Dashboard" if settings.dashboard.enabled else "Handoff Report"
+        log_safely(
+            logger,
+            logging.WARNING,
+            f"PowerContext {unit} failed to start: {error}",
+            exc_info=error,
+            extra={"event": "web_ui.start_failed", "unit": "web_ui"},
+        )
+
+
+class _ServerReadinessProbe:
+    def __init__(self, metrics: ServerMetrics | None, *, tracing: ServerTracing) -> None:
+        self._metrics = metrics
+        self._tracing = tracing
+        self._runtime: BuiltinRuntime | None = None
+        self._last_status: ReadinessStatus | None = None
+
+    def bind(self, runtime: BuiltinRuntime) -> None:
+        self._runtime = runtime
+
+    def unbind(self) -> None:
+        self._runtime = None
+        self._last_status = None
+        if self._metrics is not None:
+            self._metrics.set_ready(False)
+
+    async def __call__(self) -> ReadinessResponse:
+        with self._tracing._suppress_readiness_spans():
+            runtime = self._runtime
+            if runtime is None:
+                response = ReadinessResponse(
+                    status=ReadinessStatus.NOT_READY,
+                    checks={"runtime": "not_ready"},
+                )
+            else:
+                response = await self._check(runtime)
+        self._observe(response.status)
+        return response
+
+    async def _check(self, runtime: BuiltinRuntime) -> ReadinessResponse:
+        try:
+            readiness = await runtime.readiness()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return ReadinessResponse(
+                status=ReadinessStatus.NOT_READY,
+                checks={"runtime": "unavailable"},
+            )
+        return ReadinessResponse(
+            status=ReadinessStatus(readiness.status.value),
+            checks={name: status.value for name, status in readiness.checks.items()},
+        )
+
+    def _observe(self, status: ReadinessStatus) -> None:
+        if self._metrics is not None:
+            self._metrics.set_ready(status is not ReadinessStatus.NOT_READY)
+        if status is self._last_status:
+            return
+        self._last_status = status
+        event, message = {
+            ReadinessStatus.READY: ("server.ready", "PowerContext Server is ready"),
+            ReadinessStatus.DEGRADED: ("server.degraded", "PowerContext Server is degraded"),
+            ReadinessStatus.NOT_READY: ("server.not_ready", "PowerContext Server is not ready"),
+        }[status]
+        _log_lifecycle(event, message)
+
+
 def _log_lifecycle(event: str, message: str) -> None:
     log_safely(
         logger,
         logging.INFO,
         message,
         extra={"event": event, "unit": "server"},
+    )
+
+
+def _log_in_memory_database_warning() -> None:
+    log_safely(
+        logger,
+        logging.WARNING,
+        "PowerContext Server is using an in-memory SQLite database; "
+        "all main database data will be lost when the process stops",
+        extra={"event": "server.database.in_memory", "unit": "server"},
     )
 
 

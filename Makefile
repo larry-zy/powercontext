@@ -16,8 +16,6 @@ check: ## Run code quality tools.
 	@uv lock --locked
 	@echo "🚀 Linting code: Running prek"
 	@uv run prek run -a
-	@echo "🚀 Static type checking: Running ty"
-	@uv run ty check
 
 .PHONY: test
 test: ## Test the code with pytest
@@ -41,25 +39,20 @@ real-e2e-test: ## Run opt-in real Codex Experience/Skill tests; REAL_E2E_MODE de
 
 .PHONY: harness-sync
 harness-sync: ## Install the Bub replay harness environment.
-	@uv sync --project e2e/bub
+	@uv sync --project e2e/bub --locked
 
 .PHONY: harness-check
 harness-check: ## Validate the Bub replay harness and committed scenarios.
 	@uv run ruff check e2e/bub
 	@uv run ruff format --check e2e/bub
-	@uv run ty check --project e2e/bub --python e2e/bub/.venv e2e/bub/src integrations/bub/src
+	@uv run ty check --project e2e/bub --python e2e/bub/.venv --python-version 3.12 e2e/bub/src integrations/bub/src
+	@uv run --project e2e/bub python -m pytest e2e/bub/tests
 	@uv run --project e2e/bub powercontext-e2e --help >/dev/null
 
 .PHONY: harness-acceptance
-harness-acceptance: ## Run all deterministic Bub session replay scenarios against a Server.
-	@uv run --project e2e/bub powercontext-e2e acceptance e2e/bub/scenarios/*.yaml \
-		--output "$${POWERCONTEXT_E2E_OUTPUT:-e2e/bub/results}"
-
-.PHONY: harness-live
-harness-live: ## Run one real-model Bub session replay scenario against a Server.
-	@uv run --project e2e/bub powercontext-e2e live \
-		"$${POWERCONTEXT_E2E_SCENARIO:-e2e/bub/scenarios/project-database-decision.yaml}" \
-		--output "$${POWERCONTEXT_E2E_OUTPUT:-e2e/bub/results/live}"
+harness-acceptance: ## Evaluate workloads by ID or category against an existing Server.
+	@uv run --project e2e/bub powercontext-e2e acceptance \
+		--output "$${POWERCONTEXT_E2E_OUTPUT:-e2e/bub/results}" $(ARGS)
 
 .PHONY: harness-rescore
 harness-rescore: ## Rescore REPLAY without rerunning Bub or PowerContext.
@@ -73,21 +66,16 @@ harness-compose-check: ## Validate the SQLite and OceanBase Compose environments
 	@POWERCONTEXT_E2E_DATABASE=oceanbase e2e/bub/run.sh check
 
 .PHONY: harness-compose-acceptance
-harness-compose-acceptance: ## Build and run deterministic replay scenarios in containers.
-	@e2e/bub/run.sh acceptance
-
-.PHONY: harness-compose-live
-harness-compose-live: ## Build and run one real-model replay in containers.
-	@e2e/bub/run.sh live
+harness-compose-acceptance: ## Build and evaluate workloads by ID or category in the fixed harness.
+	@e2e/bub/run.sh acceptance $(ARGS)
 
 .PHONY: harness-compose-down
-harness-compose-down: ## Stop both isolated harness environments and remove their volumes.
-	@POWERCONTEXT_E2E_DATABASE=sqlite e2e/bub/run.sh down
-	@POWERCONTEXT_E2E_DATABASE=oceanbase e2e/bub/run.sh down
+harness-compose-down: ## Stop the selected isolated harness environment and remove its volumes.
+	@e2e/bub/run.sh down
 
 .PHONY: contract-test
-contract-test: api-generate-check ## Verify generated API code and contract bindings.
-	@uv run python -m pytest tests/test_api_contract.py
+contract-test: api-generate-check js-api-generate-check ## Verify generated API code and contract bindings.
+	@uv run python -m pytest tests/test_api_contract.py tests/test_js_operations.py
 
 .PHONY: api-generate
 api-generate: ## Generate API models and operations from OpenAPI.
@@ -96,6 +84,32 @@ api-generate: ## Generate API models and operations from OpenAPI.
 .PHONY: api-generate-check
 api-generate-check: ## Verify generated API code is current.
 	@uv run python scripts/generate_api.py --check
+
+.PHONY: js-api-generate
+js-api-generate: ## Generate the DeepSeek Harness operations table from OpenAPI.
+	@uv run python scripts/generate_js_operations.py
+
+.PHONY: js-api-generate-check
+js-api-generate-check: ## Verify generated JS operations are current.
+	@uv run python scripts/generate_js_operations.py --check
+
+.PHONY: js-test
+js-test: ## Run DeepSeek Harness plugin unit tests.
+	@pnpm --dir integrations/dsh/plugins/powercontext test
+
+.PHONY: openclaw-plugin-build
+openclaw-plugin-build: ## Build the external OpenClaw memory plugin.
+	@pnpm --dir integrations/openclaw/plugins/memory-powercontext build
+
+.PHONY: openclaw-plugin-pack
+openclaw-plugin-pack: ## Build and pack the external OpenClaw memory plugin.
+	@pnpm --dir integrations/openclaw/plugins/memory-powercontext pack:local
+
+.PHONY: pi-test
+pi-test: ## Install and test the Pi package.
+	@pnpm --dir integrations/pi/plugins/powercontext install --frozen-lockfile
+	@pnpm --dir integrations/pi/plugins/powercontext test
+	@pnpm --dir integrations/pi/plugins/powercontext run typecheck
 
 .PHONY: build
 build: clean-build ## Build wheel file

@@ -36,6 +36,8 @@ Server 配置使用 `POWERCONTEXT_SERVER_` 前缀。
 | `POWERCONTEXT_SERVER_AUTH_ENABLED` | `false` | HTTP 和 MCP 是否要求一个静态 Bearer token |
 | `POWERCONTEXT_SERVER_AUTH_TOKEN` | 未设置 | 静态 Bearer token；启用鉴权时必须设置 |
 | `POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK` | `false` | 在鉴权关闭时显式允许绑定非 loopback 地址 |
+| `POWERCONTEXT_SERVER_DASHBOARD_ENABLED` | `true` | 在 Server 根路径 `/` 启用 Dashboard |
+| `POWERCONTEXT_SERVER_DASHBOARD_SCOPES` | `[]` | Dashboard 可选择的 scope JSON 数组 |
 | `POWERCONTEXT_SERVER_LOGGING_LEVEL` | `INFO` | operational log 级别 |
 | `POWERCONTEXT_SERVER_LOGGING_FORMAT` | `console` | `console` 或结构化 `json` 输出 |
 | `POWERCONTEXT_SERVER_LOGGING_ACCESS` | `true` | 记录外部 HTTP 和逻辑 MCP request completion |
@@ -61,6 +63,9 @@ Server 前必须配置 TLS。
 
 Python Client 和 CLI 对出站请求应用相同规则：明文 `http://` 的 Server URL 仅接受 loopback 主机，并且 Client 拒绝
 通过明文的非 loopback 连接发送 Bearer token。
+
+Dashboard 默认启用，并与 HTTP API、MCP 共用监听地址和端口。默认未配置 scope，页面会显示空状态；Dashboard
+初始化失败只记录包含直接原因的 warning，不影响 Server 的 HTTP API、MCP 和健康检查启动。
 
 指定 SQLite 路径并启用定时提取的示例：
 
@@ -144,6 +149,9 @@ CLI 管理的 Server 启用 recording 和 export，请安装 `powercontext[cli,s
 OpenTelemetry 环境变量进行配置。不使用 `powercontext` command 的 programmatic Server integration 可以省略
 `cli` extra。
 
+启用 tracing 后，PowerContext 自己构造的 generation 与 embedding 调用也会产生 span，且不记录 prompt、模型响应、
+Memory 内容或向量。可运行的配置见 [用 Phoenix 查看 trace](../how-to/trace-with-phoenix.md)。
+
 使用 OceanBase 时，通过环境或 secret manager 提供 URL：
 
 ```bash
@@ -171,23 +179,21 @@ export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION=1024
 
 Embedding normalization 默认为 `unit`。
 
-### SQLite Vec1
+### SQLite 向量检索
 
-SQLite vector 和 hybrid search 还需要 0.7 或更高版本的
-[SQLite Vec1](https://sqlite.org/vec1/doc/trunk/doc/vec1.md) loadable extension。PowerContext 不负责下载、构建或更新
-这个 native library。请先获取适用于 Server 操作系统和架构的构建产物，再同时配置 extension 路径和完整的
-embedding profile：
+SQLite vector 和 hybrid search 使用 [sqlite-vec](https://alexgarcia.xyz/sqlite-vec/)，它已包含在
+`powercontext[builtin]` 依赖中。只需配置完整的 embedding profile，无需配置 extension 路径：
 
 ```bash
 export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL=provider:embedding-model
 export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_PROFILE_ID=embedding-model-v1
 export POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_DIMENSION=1024
-export POWERCONTEXT_SERVER_DATABASE_VEC1_EXTENSION=/opt/sqlite-extensions/vec1
+export POWERCONTEXT_SERVER_DATABASE_URL=sqlite+aiosqlite:////srv/powercontext/powercontext.db
 powercontext server run
 ```
 
-extension 路径必须指向 SQLite loader 可以打开的 library。Server 打开数据库时，PowerContext 会加载并探测该
-extension；如果 library 不兼容或版本低于 0.7，启动会失败。
+Server 打开数据库时，PowerContext 会加载并探测捆绑的 extension；如果当前 platform 或 SQLite build 与 package
+中的 library 不兼容，启动会失败。
 
 在另一个终端确认初始化后的 Runtime 已报告 vector 和 hybrid search：
 
@@ -195,8 +201,7 @@ extension；如果 library 不兼容或版本低于 0.7，启动会失败。
 powercontext capabilities
 ```
 
-如果没有可用的 Vec1，请不要设置 `POWERCONTEXT_SERVER_DATABASE_VEC1_EXTENSION`。即使没有 embedding model 或
-native extension，SQLite full-text search 仍然可用。
+没有配置 embedding model 时，SQLite full-text search 仍然可用。
 
 ## CLI Server 连接
 
@@ -223,3 +228,52 @@ native extension，SQLite full-text search 仍然可用。
 
 Codex Hook 外层超时为十秒。Server 不可用或拒绝鉴权时，恢复、采集和 flush 独立降级，不会阻塞 Codex。
 该变量必须存在于启动 Codex 的进程环境中；修改后需要重启 Codex。
+
+## Claude Code 插件
+
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `POWERCONTEXT_CLAUDE_SERVER_URL` | `http://127.0.0.1:8000` | Hook 使用的 Server base URL |
+| `POWERCONTEXT_CLAUDE_SCOPE_ID` | 根据 Git remote 或项目路径生成 | 覆盖项目 scope |
+| `POWERCONTEXT_CLAUDE_AUTHORIZATION` | 未设置 | Hook 与 MCP 请求使用的完整 `Bearer <token>` header |
+| `POWERCONTEXT_CLAUDE_CAPTURE_PROMPTS` | `true` | 把用户 prompt 采集为普通 Source 证据 |
+| `POWERCONTEXT_CLAUDE_FLUSH_ON_CAPTURE` | `false` | 采集后等待 Source 处理 |
+| `POWERCONTEXT_CLAUDE_REQUEST_TIMEOUT_SECONDS` | `1` | Hook 单次请求超时 |
+| `POWERCONTEXT_CLAUDE_HTTP_BUDGET_SECONDS` | `4` | 召回、采集和可选 flush 共用的 Hook HTTP 时间预算 |
+| `POWERCONTEXT_CLAUDE_FLUSH_MAX_CALLS` | `4` | 每个 prompt 最多执行的 flush 次数；有效值为 1 到 16 |
+
+`powercontext setup claude-code` 会把 `server_url` 和 `capture_prompts` 保存为非敏感的 Claude Code 插件
+选项。启动 Claude Code 的进程中，对应的 `POWERCONTEXT_CLAUDE_*` 环境变量优先级更高。
+Authorization 只能来自环境变量，不能加入 Server URL 或插件选项。
+
+`UserPromptSubmit` Hook 的外层超时为十秒。召回与采集共用一个 wall-clock 时间预算，但会独立降级。
+明文 HTTP 只允许连接 loopback endpoint；远程 Server 必须使用 HTTPS。修改环境变量后需要重启 Claude Code。
+
+## DeepSeek Harness 插件
+
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `POWERCONTEXT_DSH_BASE_URL` | `http://127.0.0.1:8000` | 插件使用的 Server 地址 |
+| `POWERCONTEXT_DSH_SCOPE_ID` | 根据 Git remote 或项目路径生成 | 覆盖项目 scope |
+| `POWERCONTEXT_DSH_AUTHORIZATION` | 未设置 | 插件 HTTP 请求使用的完整 `Bearer <token>` header |
+| `POWERCONTEXT_DSH_CAPTURE_PROMPTS` | `true` | 把用户提示词采集为 Source 证据 |
+| `POWERCONTEXT_DSH_FLUSH_ON_CAPTURE` | `false` | 采集后等待 Source 处理 |
+
+`timeoutMs`、`requestTimeoutMs`、`maxBytes` 和 `flushMaxCalls` 是插件 patch 配置。Server 不可用时，召回和采集会降级；修改这些变量后需要重启 `dsh web`。
+
+## Pi package
+
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `POWERCONTEXT_PI_BASE_URL` | `http://127.0.0.1:8000` | Server base URL；非 loopback endpoint 必须使用 HTTPS |
+| `POWERCONTEXT_PI_SCOPE_ID` | 根据 Git remote 或项目路径生成 | 覆盖项目 scope |
+| `POWERCONTEXT_PI_AUTHORIZATION` | 未设置 | package HTTP 请求使用的完整 `Bearer <token>` header |
+| `POWERCONTEXT_PI_CAPTURE_PROMPTS` | `true` | 把符合条件的用户提示词采集为 Source 证据 |
+| `POWERCONTEXT_PI_REQUEST_TIMEOUT_MS` | `1000` | 单请求超时，单位毫秒 |
+| `POWERCONTEXT_PI_HTTP_BUDGET_MS` | `4000` | 召回/采集共享 HTTP 时间预算，单位毫秒 |
+| `POWERCONTEXT_PI_MAX_BYTES` | `8000` | 请求并校验的 PreparedContext byte 上限（`512`–`32768`） |
+| `POWERCONTEXT_PI_FLUSH_ON_CAPTURE` | `false` | 在 prompt hook 中等待已采集 Source 的处理 |
+| `POWERCONTEXT_PI_FLUSH_MAX_CALLS` | `4` | 一个 pending Source 最多 flush 次数 |
+
+Pi 会拒绝包含凭据、query 或 fragment 的 base URL。召回、采集和边界 flush 都会正常降级；显式 `pc_*` 持久化写入
+必须确认，Pi 没有交互 UI 时会被拒绝。修改这些变量后需要重启 Pi。

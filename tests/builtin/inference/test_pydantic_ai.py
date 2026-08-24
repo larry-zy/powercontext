@@ -1,3 +1,17 @@
+# Copyright (c) 2026 OceanBase.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import asyncio
@@ -5,6 +19,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic_ai import Embedder
 from pydantic_ai.embeddings import (
     EmbeddingModel as PydanticAIEmbeddingModelBase,
@@ -20,6 +37,7 @@ from pydantic_ai.embeddings.result import EmbedInputType
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.instrumented import InstrumentationSettings, InstrumentedModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RequestUsage
 
@@ -31,8 +49,10 @@ from powercontext.builtin.inference import (
 )
 from powercontext.builtin.inference.pydantic_ai import (
     InferenceLimits,
+    PydanticAIConfigurationError,
     PydanticAIEmbeddingModel,
     PydanticAIStructuredGenerator,
+    probe_pydantic_ai_model,
 )
 
 
@@ -44,6 +64,19 @@ class Question:
 @dataclass(frozen=True, slots=True)
 class Answer:
     value: str
+
+
+# Nested on purpose: retry feedback only carries the raw model output when the validation
+# error location is longer than one element, which a flat output type cannot produce.
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    text: str
+    intent: str
+
+
+@dataclass(frozen=True, slots=True)
+class Proposal:
+    candidates: tuple[Candidate, ...]
 
 
 TEST_PROFILE = EmbeddingProfile(
@@ -223,6 +256,32 @@ def test_structured_generator_times_out_and_cancels_underlying_call() -> None:
     asyncio.run(scenario())
 
 
+def test_generation_readiness_probe_uses_one_bounded_text_request() -> None:
+    observed_max_tokens: list[int | None] = []
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert messages
+        observed_max_tokens.append(None if info.model_settings is None else info.model_settings.get("max_tokens"))
+        return ModelResponse(parts=[TextPart("ok")])
+
+    asyncio.run(probe_pydantic_ai_model(FunctionModel(respond), timeout_seconds=1))
+
+    assert observed_max_tokens == [1]
+
+
+def test_generation_readiness_probe_maps_bad_provider_endpoint_without_leaking_body() -> None:
+    async def reject(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        raise ModelHTTPError(404, "test-model", {"api_key": "secret-provider-body"})
+
+    async def scenario() -> None:
+        with pytest.raises(PydanticAIConfigurationError) as error:
+            await probe_pydantic_ai_model(FunctionModel(reject), timeout_seconds=1)
+        assert "secret-provider-body" not in str(error.value)
+
+    asyncio.run(scenario())
+
+
 def test_invalid_structured_output_maps_to_stable_error() -> None:
     async def scenario() -> None:
         generator = PydanticAIStructuredGenerator(
@@ -237,6 +296,48 @@ def test_invalid_structured_output_maps_to_stable_error() -> None:
             await generator.generate(Question("bounded evidence"))
 
     asyncio.run(scenario())
+
+
+def test_instrumented_generation_spans_exclude_schema_retry_content() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    instrumentation = InstrumentationSettings(
+        tracer_provider=provider,
+        include_content=False,
+        include_binary_content=False,
+        include_model_request_parameters=False,
+    )
+    # The first response drops the required `intent`, so the retry feedback quotes it back.
+    pending = [
+        '{"candidates":[{"text":"traveler prefers aisle seats"}]}',
+        '{"candidates":[{"text":"redacted","intent":"add"}]}',
+    ]
+
+    async def reply(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(pending.pop(0))])
+
+    async def scenario() -> None:
+        generator = PydanticAIStructuredGenerator(
+            model=InstrumentedModel(FunctionModel(reply), instrumentation),
+            instructions="Propose candidates.",
+            input_type=Question,
+            output_type=Proposal,
+        )
+
+        result = await generator.generate(Question("bounded evidence"))
+
+        assert result.output.candidates[0].intent == "add"
+
+    asyncio.run(scenario())
+
+    spans = exporter.get_finished_spans()
+    # Both responses consumed and two chat spans recorded prove the retry path ran.
+    assert not pending
+    assert len([span for span in spans if span.name.startswith("chat ")]) == 2
+    for span in spans:
+        assert "traveler prefers aisle seats" not in str(span.attributes)
 
 
 def test_embedding_adapter_returns_validated_vectors_and_usage() -> None:
@@ -306,6 +407,35 @@ def test_embedding_adapter_maps_provider_errors_and_preserves_cause() -> None:
         assert "secret" not in str(error.value)
 
     asyncio.run(scenario())
+
+
+def test_instrumented_embedding_spans_nest_under_the_active_span_without_recording_text() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    instrumentation = InstrumentationSettings(
+        tracer_provider=provider,
+        include_content=False,
+        include_binary_content=False,
+        include_model_request_parameters=False,
+    )
+    model = PydanticAIEmbeddingModel(
+        embedder=Embedder(TestEmbeddingModel(dimensions=3), instrument=instrumentation),
+        profile=TEST_PROFILE,
+    )
+
+    async def scenario() -> None:
+        with provider.get_tracer("test").start_as_current_span("powercontext flush_memory"):
+            await model.embed(("bounded evidence",))
+
+    asyncio.run(scenario())
+
+    spans = exporter.get_finished_spans()
+    operation = next(span for span in spans if span.name == "powercontext flush_memory")
+    embeddings = next(span for span in spans if span.name.startswith("embeddings "))
+    assert embeddings.parent is not None
+    assert embeddings.parent.span_id == operation.context.span_id
+    assert "bounded evidence" not in str(embeddings.attributes)
 
 
 def test_embedding_adapter_maps_empty_provider_data_to_unavailable() -> None:

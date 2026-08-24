@@ -1,6 +1,6 @@
 ---
 title: 排查问题
-description: 诊断 PowerContext 安装、Server、数据库和 Codex 插件问题。
+description: 诊断 PowerContext 安装、Server、数据库和宿主集成问题。
 ---
 
 # 排查问题
@@ -11,7 +11,16 @@ description: 诊断 PowerContext 安装、Server、数据库和 Codex 插件问�
 powercontext doctor
 ```
 
-任一检查失败时，命令会以状态码 1 退出。自动化场景可添加 `--json`。
+该命令检查安装包、Server liveness 和 Server readiness；只有所有检查均为 `ok` 时才以状态码 0 退出。
+`degraded` 表示仍可使用，但不算完整诊断成功。自动化场景可添加 `--json`，顶层结果和每个检查都会包含
+`ok` 与 `status`。可单独检查可选的宿主集成：
+
+```bash
+powercontext doctor codex
+powercontext doctor claude-code
+powercontext doctor dsh
+powercontext doctor pi
+```
 
 ## 安装时无法读取 Git 地址
 
@@ -24,7 +33,7 @@ git ls-remote https://github.com/oceanbase/powercontext.git HEAD
 如果失败，请配置 Git 使用的 credential helper 或 SSH key，再重新运行 `uv tool install`。`uv` 使用 Git
 凭据配置；PowerContext 不接收或保存仓库凭据。
 
-## 找不到 `powercontext` 或 `codex`
+## 找不到 `powercontext`、`codex`、`claude`、`dsh` 或 `pi`
 
 执行：
 
@@ -32,12 +41,23 @@ git ls-remote https://github.com/oceanbase/powercontext.git HEAD
 uv tool dir --bin
 command -v powercontext
 command -v codex
+command -v claude
+command -v dsh
+command -v pi
 ```
 
-必要时把 uv tool bin 目录加入 `PATH`。Codex CLI 不可用时，`powercontext setup codex` 会报告错误，不会继续
-安装插件。
+必要时把 uv tool bin 目录加入 `PATH`。宿主 CLI 不可用时，`powercontext setup codex`、
+`powercontext setup claude-code`、`powercontext setup dsh` 和 `powercontext setup pi` 都会报告错误，而不会尝试安装。
 
 ## 插件缺失或版本不一致
+
+先在不涉及 Server 的情况下确认集成故障：
+
+```bash
+powercontext doctor codex
+powercontext doctor dsh
+powercontext doctor pi
+```
 
 使用与工具一致的 ref 重新安装：
 
@@ -47,6 +67,41 @@ codex plugin list --json
 ```
 
 然后开启新的 Codex 会话。如果提示词恢复和采集没有运行，请检查 `/hooks`。
+
+对于 Claude Code，执行：
+
+```bash
+powercontext doctor claude-code
+powercontext setup claude-code --source oceanbase/powercontext --ref <ref>
+claude plugin list --json
+```
+
+然后开启新的 Claude Code 会话并检查 `/hooks` 与 `/mcp`。插件清单应只包含一个
+`UserPromptSubmit` Hook 和一个 `powercontext` MCP Server。
+
+如果 setup 在创建新的 user scope 对象时失败，它会尝试只删除本次调用创建的插件与 Marketplace 项，
+setup 前已有的对象会保留。修正命令报告的 Claude CLI 或仓库错误后，重新执行同一个 setup 命令。
+
+对于 DeepSeek Harness，执行：
+
+```bash
+powercontext doctor dsh
+powercontext setup dsh --source oceanbase/powercontext --ref <ref>
+dsh --profile web --dump-config
+```
+
+然后开启新的 DeepSeek Harness 会话，并确认 dump-config 含有 `id: powercontext-dsh`。DSH 插件目录必须包含
+`lib/index.js`。
+
+对于 Pi，执行：
+
+```bash
+powercontext doctor pi
+powercontext setup pi --source oceanbase/powercontext --ref <ref>
+pi list
+```
+
+然后开启新的 Pi 会话，并确认 `pi list` 列出了 PowerContext package source。
 
 ## Server 检查失败
 
@@ -63,7 +118,9 @@ powercontext doctor --server-url http://127.0.0.1:9000
 powercontext --server-url http://127.0.0.1:9000 ready
 ```
 
-随附的 Codex 插件默认使用 8000 端口。
+随附的 Codex 和 Claude Code 插件以及 Pi package 默认使用 8000 端口。liveness 失败表示进程无法响应健康请求，此时不会继续检查
+readiness。HTTP 503 的 `not_ready` 表示 Runtime 或数据库无法接受工作；HTTP 200 的 `degraded` 表示已配置的
+推理能力异常，但数据库操作仍然可用。Human 与 JSON 输出都会保留 Server 返回的各项检查状态。
 
 ## Server 无法打开数据库
 
@@ -80,6 +137,16 @@ powercontext server run
 每次启动或诊断该实例时都应使用同一个环境变量。对于文件型 SQLite 数据库，PowerContext 会创建缺失的父
 目录。
 
+## 推理服务 readiness 检查失败
+
+配置 generation 或 embedding 后，Server readiness 会向 provider 发起一次最小化真实请求。这样可以发现只有
+实际请求时才能确认的凭据或 endpoint 问题，包括 base URL 遗漏 provider API 前缀。稳定状态包括 `ready`、
+`unavailable`、`timeout` 和 `misconfigured`；响应不会包含凭据、provider 响应正文或已配置 URL。
+
+推理检查失败时，overall readiness 为 HTTP 200 的 `degraded`，不会使整个 Server 退出流量。`ready` 和
+`misconfigured` 会缓存 300 秒；临时的 `timeout` 和 `unavailable` 会在 30 秒后重试。并发健康请求共用同一次
+刷新。修改静态配置后如需立即检查，请重启 Server；否则等待缓存过期。
+
 ## Memory 可以显式写入，但采集的提示词没有生成 Memory
 
 显式 Memory 操作不需要模型；把采集的 Source 证据转换为 Memory 则需要。请配置 generation model 及其
@@ -91,10 +158,10 @@ powercontext capabilities
 
 `Memory extraction: disabled` 表示 Server 没有 generation model。
 
-## Server 停止后 Codex 仍继续工作
+## Server 停止后编程 Agent 仍继续工作
 
-这是预期行为。Prompt Hook 会正常降级，Memory 故障不能阻塞普通 Codex 工作。重启 Server 后即可恢复
-检索和采集，现有数据库会被自动重新打开。
+这是预期行为。Codex、Claude Code 和 Pi 集成都遵循 fail open，Memory 故障不能阻塞普通工作。
+重启 Server 后即可恢复召回和采集，现有数据库会被自动重新打开。
 
 ## Codex 没有注入召回上下文
 
@@ -104,4 +171,54 @@ powercontext capabilities
 省略 query 与准备好的上下文正文。
 
 执行 `powercontext capabilities`，确认 Context versions 中包含
+`powercontext.prepared-context.v1`。
+
+## Claude Code 没有注入召回上下文
+
+先区分安装问题和 Server 健康问题：
+
+```bash
+powercontext doctor claude-code
+powercontext doctor
+```
+
+第一个命令只检查 Claude CLI 和已启用插件，不连接 Server；第二个命令检查 Server liveness 和 readiness。
+然后查看 Hook 在 stderr 输出的单行事件。Claude Code 使用与 Codex 相同的 Prepared Context contract，
+component 为 `powercontext.claude_code.recall`：
+
+| Outcome | 处理方式 |
+| --- | --- |
+| `empty` | 没有准备出相关 Memory，无需处理 |
+| `authentication_failed` | 启动 Claude Code 前导出完整的 `POWERCONTEXT_CLAUDE_AUTHORIZATION` header |
+| `version_mismatch` | 从同一个 ref 安装 package 和插件，再重启两个进程 |
+| `server_unavailable` | 启动 Server，或修正 `POWERCONTEXT_CLAUDE_SERVER_URL` |
+| `invalid_response` | 检查 proxy、redirect、不兼容 schema、错误 JSON 或超大响应 |
+
+诊断不会记录 token、query、scope、Prepared Context 正文或响应正文。Prompt 采集与召回彼此独立：采集失败
+不会抑制有效上下文，召回失败也不会抑制采集。
+
+## Claude Code MCP 认证失败
+
+Hook 与 MCP `headersHelper` 都从启动 Claude Code 的进程环境读取
+`POWERCONTEXT_CLAUDE_AUTHORIZATION`。停止当前进程，导出完整 header，再重新启动：
+
+```bash
+export POWERCONTEXT_CLAUDE_AUTHORIZATION="Bearer $POWERCONTEXT_LOCAL_TOKEN"
+claude
+```
+
+不要把 token 加入 `.mcp.json`、Server URL 或插件选项。重启后使用 `/mcp` 确认 `powercontext` Server 已连接。
+
+## Pi 没有注入召回上下文
+
+先分别检查 package 和 Server：
+
+```bash
+powercontext doctor pi
+powercontext doctor
+```
+
+安装 package 或修改 `POWERCONTEXT_PI_*` 变量后，请重启 Pi。在新的 Pi 会话中运行 `/pc doctor`，直接检查已配置的
+Server。召回会刻意静默并正常降级：Server 不可用、重定向、超时或返回无效 PreparedContext 时，Pi 会继续运行且不
+添加上下文。恢复 Server 后，运行 `powercontext capabilities`，确认 Context versions 中包含
 `powercontext.prepared-context.v1`。
