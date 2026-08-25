@@ -228,17 +228,30 @@ def test_server_command_layers_partial_cli_overrides_over_environment_settings(
     tracing.shutdown.assert_called_once_with()
 
 
+@pytest.fixture
+def _wide_error_panel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Render typer's rich error panel wide enough that asserted tokens are never wrapped.
+
+    Under GitHub Actions typer forces ``force_terminal=True``; combined with the runner's
+    ``TERM=dumb`` that pins rich's console to 80 columns and ignores ``COLUMNS`` (the dumb-terminal
+    branch returns before honouring it), which hyphen-breaks ``--host`` and force-splits the long
+    opt-in env var. Neutralise the forced terminal so the captured pipe reads as non-terminal (hence
+    non-dumb) and set an explicit width, so the panel stays on wide lines in any environment.
+    """
+
+    monkeypatch.setattr("typer.rich_utils.FORCE_TERMINAL", None)
+    monkeypatch.setattr("typer.rich_utils.MAX_WIDTH", 10_000)
+
+
 def test_server_command_rejects_an_unauthenticated_non_loopback_host_override(
     monkeypatch: pytest.MonkeyPatch,
+    _wide_error_panel: None,
 ) -> None:
     run_server = Mock()
     tracing = Mock()
     monkeypatch.setattr("powercontext.server.cli._run_server", run_server)
     monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config: None)
     monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: tracing)
-    # Keep the error panel on one line so the asserted tokens are not hard-wrapped by the terminal
-    # width (rich breaks on hyphens and force-splits long words on a narrow CI terminal).
-    monkeypatch.setenv("COLUMNS", "1000")
 
     result = CliRunner().invoke(
         create_cli([server_app]),
@@ -255,6 +268,7 @@ def test_server_command_rejects_an_unauthenticated_non_loopback_host_override(
 
 def test_server_command_reports_a_friendly_error_when_auth_lacks_a_token(
     monkeypatch: pytest.MonkeyPatch,
+    _wide_error_panel: None,
 ) -> None:
     run_server = Mock()
     tracing = Mock()
@@ -263,8 +277,6 @@ def test_server_command_reports_a_friendly_error_when_auth_lacks_a_token(
     monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: tracing)
     monkeypatch.setenv("POWERCONTEXT_SERVER_AUTH_ENABLED", "true")
     monkeypatch.delenv("POWERCONTEXT_SERVER_AUTH_TOKEN", raising=False)
-    # Keep the error panel on one line so the asserted env-var tokens are not hard-wrapped (see above).
-    monkeypatch.setenv("COLUMNS", "1000")
 
     result = CliRunner().invoke(create_cli([server_app]), ["server", "run"])
 
