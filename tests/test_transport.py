@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -32,10 +33,20 @@ from powercontext.transport import LOOPBACK_HOSTS, is_loopback_host, is_plaintex
 
 _ALL_INTERFACES = "0.0.0.0"  # noqa: S104 - a non-loopback bind used to exercise the policy.
 
-# Both agent plugins ship isolated (they do not depend on powercontext) and each vendors its own
-# copy of the loopback policy. Load every copy by path and pin it to the shared contract so drift in
-# any one implementation is caught. Loading is defensive: a moved path or a plugin import error
-# skips that plugin's drift guard rather than failing collection for the whole module.
+# Loopback host vectors shared with the TypeScript plugins' own drift guards (e.g. the Pi plugin's
+# transport-policy.spec.ts). Keeping one JSON source of truth means a plugin that drifts from the
+# 127.0.0.0/8 loopback contract fails here or in that plugin's suite -- never silently in both.
+_LOOPBACK_VECTORS = json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "transport_loopback_vectors.json").read_text(encoding="utf-8"),
+)
+_SHARED_LOOPBACK_HOSTS: list[str] = _LOOPBACK_VECTORS["loopback"]
+_SHARED_NON_LOOPBACK_HOSTS: list[str] = _LOOPBACK_VECTORS["non_loopback"]
+
+# The Python plugins (Codex, Claude Code) ship isolated (they do not depend on powercontext) and
+# each vendors its own copy of the loopback policy. Load every copy by path and pin it to the shared
+# contract so drift in any one implementation is caught. Loading is defensive: a moved path or a
+# plugin import error skips that plugin's drift guard rather than failing collection for the whole
+# module. The TypeScript plugins are pinned by their own Vitest suites against the same vectors.
 _INTEGRATIONS = Path(__file__).resolve().parent.parent / "integrations"
 _VENDORED_PLUGIN_PATHS = {
     "codex": _INTEGRATIONS / "codex" / "plugins" / "powercontext" / "settings.py",
@@ -70,18 +81,14 @@ _VENDORED_PLUGIN_PARAMS = [
 ]
 
 
-@pytest.mark.parametrize(
-    "host",
-    ["127.0.0.1", "127.0.0.2", "127.1.2.3", "localhost", "LOCALHOST", "::1", "[::1]"],
-)
+# The shared vectors carry only valid URL authorities so both languages can build them into a URL;
+# `"::1"` (unbracketed) plus the falsy inputs are Python-only edge cases the shared set cannot express.
+@pytest.mark.parametrize("host", [*_SHARED_LOOPBACK_HOSTS, "::1"])
 def test_loopback_hosts_are_recognized(host: str) -> None:
     assert is_loopback_host(host)
 
 
-@pytest.mark.parametrize(
-    "host",
-    [_ALL_INTERFACES, "memory.example", "192.168.1.10", "::", "", None],
-)
+@pytest.mark.parametrize("host", [*_SHARED_NON_LOOPBACK_HOSTS, "::", "", None])
 def test_non_loopback_hosts_are_rejected(host: str | None) -> None:
     assert not is_loopback_host(host)
 
@@ -192,18 +199,7 @@ def test_vendored_plugin_shares_the_loopback_host_set(plugin: ModuleType) -> Non
 
 
 @pytest.mark.parametrize("plugin", _VENDORED_PLUGIN_PARAMS)
-@pytest.mark.parametrize(
-    "host",
-    [
-        "127.0.0.1",
-        "127.0.0.2",
-        "localhost",
-        "[::1]",
-        _ALL_INTERFACES,
-        "memory.example",
-        "192.168.1.10",
-    ],
-)
+@pytest.mark.parametrize("host", [*_SHARED_LOOPBACK_HOSTS, *_SHARED_NON_LOOPBACK_HOSTS])
 def test_vendored_plugin_matches_the_shared_plaintext_policy(plugin: ModuleType, host: str) -> None:
     """Each plugin's vendored loopback check must agree with the shared transport contract."""
 
