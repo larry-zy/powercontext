@@ -79,8 +79,12 @@ def run(
         http_overrides["host"] = host
     if port is not None:
         http_overrides["port"] = port
+    # Pass ``http`` as a partial mapping so ``nested_model_default_partial_update`` merges it with the
+    # environment; unpack from a kwargs dict so the partial dict is not type-checked against the full
+    # ``HttpConfig`` the field annotation advertises.
+    settings_kwargs: dict[str, Any] = {"http": http_overrides} if http_overrides else {}
     try:
-        settings = ServerSettings(http=http_overrides) if http_overrides else ServerSettings()
+        settings = ServerSettings(**settings_kwargs)
     except ValidationError as error:
         raise _friendly_bad_parameter(error) from error
     configure_server_logging(settings.logging)

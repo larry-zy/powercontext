@@ -236,6 +236,9 @@ def test_server_command_rejects_an_unauthenticated_non_loopback_host_override(
     monkeypatch.setattr("powercontext.server.cli._run_server", run_server)
     monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config: None)
     monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: tracing)
+    # Keep the error panel on one line so the asserted tokens are not hard-wrapped by the terminal
+    # width (rich breaks on hyphens and force-splits long words on a narrow CI terminal).
+    monkeypatch.setenv("COLUMNS", "1000")
 
     result = CliRunner().invoke(
         create_cli([server_app]),
@@ -260,6 +263,8 @@ def test_server_command_reports_a_friendly_error_when_auth_lacks_a_token(
     monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: tracing)
     monkeypatch.setenv("POWERCONTEXT_SERVER_AUTH_ENABLED", "true")
     monkeypatch.delenv("POWERCONTEXT_SERVER_AUTH_TOKEN", raising=False)
+    # Keep the error panel on one line so the asserted env-var tokens are not hard-wrapped (see above).
+    monkeypatch.setenv("COLUMNS", "1000")
 
     result = CliRunner().invoke(create_cli([server_app]), ["server", "run"])
 
