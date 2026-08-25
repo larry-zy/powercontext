@@ -121,6 +121,16 @@ def test_client_allows_a_bearer_token_over_loopback_plaintext() -> None:
     assert client is not None
 
 
+def test_client_allows_a_bearer_token_over_a_caller_supplied_transport() -> None:
+    # A caller-supplied http_client owns its transport (here an in-process ASGI/mock transport), so
+    # the base_url scheme is only a routing label and the plaintext-token guard must not fire.
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"})),
+    )
+    client = PowerContextClient("http://testserver", token="probe-token", http_client=http_client)  # noqa: S106 - test credential.
+    assert client is not None
+
+
 def test_client_allows_an_unauthenticated_non_loopback_transport() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"status": "ok"})

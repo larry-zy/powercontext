@@ -188,7 +188,12 @@ class PowerContextClient:
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        if token and is_plaintext_non_loopback(self._base_url):
+        # The plaintext guard only holds meaning for the transport this facade opens itself: there
+        # ``base_url``'s scheme accurately reflects what crosses the wire. A caller-supplied
+        # ``http_client`` owns its own transport (ASGI in-process, a Unix socket, a TLS-terminating
+        # proxy -- all of which carry an ``http://`` label), so the scheme is no longer a reliable
+        # signal and enforcing it would only produce false positives.
+        if token and http_client is None and is_plaintext_non_loopback(self._base_url):
             raise ValueError("refusing to send a bearer token over unencrypted non-loopback HTTP")  # noqa: TRY003
         self._headers = {"Authorization": f"Bearer {token}"} if token else None
         self._owned_http_client: httpx.AsyncClient | None = None
