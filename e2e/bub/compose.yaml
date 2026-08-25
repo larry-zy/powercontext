@@ -39,9 +39,6 @@ services:
       - POWERCONTEXT_SERVER_INFERENCE_GENERATION_TIMEOUT_SECONDS=${POWERCONTEXT_SERVER_INFERENCE_GENERATION_TIMEOUT_SECONDS:-120}
       - POWERCONTEXT_SERVER_DATABASE_KIND=sqlite
       - POWERCONTEXT_SERVER_DATABASE_URL=sqlite+aiosqlite:////data/powercontext.db
-      # The image binds 0.0.0.0 so the port is reachable from the harness; this Compose network is
-      # isolated, so opt the unauthenticated Server into the non-loopback bind it now guards against.
-      - POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true
     healthcheck:
       test:
         - CMD

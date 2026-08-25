@@ -24,13 +24,30 @@ from pydantic import ValidationError
 from powercontext.server.factory import create_server_app
 from powercontext.server.logging import configure_server_logging
 from powercontext.server.settings import (
-    HttpConfig,
+    MissingBearerTokenError,
     ServerSettings,
-    is_unauthenticated_non_loopback_bind,
+    UnauthenticatedNonLoopbackBindError,
 )
 from powercontext.server.tracing import configure_server_tracing
 
 HELP_OPTION_NAMES = ("-h", "--help")
+
+# Shown when the merged bind fails the unauthenticated-non-loopback policy. It repeats the
+# operator's concrete levers -- authenticate, stay on loopback, or opt in via the full env var --
+# instead of surfacing pydantic's internal validation dump (see ``_friendly_bad_parameter``).
+_UNSAFE_BIND_CLI_MESSAGE = (
+    "refusing to bind an unauthenticated Server to a non-loopback address; "
+    "enable authentication, keep the bind on loopback, or set "
+    "POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true to opt in"
+)
+
+# Shown when authentication is enabled without a token; names the concrete env-var levers the
+# operator can set instead of surfacing pydantic's internal validation dump.
+_MISSING_BEARER_CLI_MESSAGE = (
+    "authentication is enabled but no bearer token is configured; "
+    "set POWERCONTEXT_SERVER_AUTH_TOKEN=... or disable it with "
+    "POWERCONTEXT_SERVER_AUTH_ENABLED=false"
+)
 
 app = typer.Typer(
     name="server",
@@ -52,26 +69,20 @@ def run(
 ) -> None:
     """Run the ASGI service in the foreground."""
 
+    # Layer the CLI overrides in *before* validation. ``ServerSettings`` enforces its bind policy on
+    # construction, so the command-line ``--host`` / ``--port`` must be merged with the environment
+    # first -- otherwise a safe ``--host 127.0.0.1`` could not repair an unsafe
+    # ``POWERCONTEXT_SERVER_HTTP_HOST=0.0.0.0`` (and vice versa), because the cross-field check would
+    # run against the environment value alone rather than the address we actually bind.
+    http_overrides: dict[str, Any] = {}
+    if host is not None:
+        http_overrides["host"] = host
+    if port is not None:
+        http_overrides["port"] = port
     try:
-        environment = ServerSettings()
+        settings = ServerSettings(http=http_overrides) if http_overrides else ServerSettings()
     except ValidationError as error:
-        raise typer.BadParameter(str(error)) from error
-    http = HttpConfig(
-        host=environment.http.host if host is None else host,
-        port=environment.http.port if port is None else port,
-    )
-    settings = environment.model_copy(update={"http": http})
-    if is_unauthenticated_non_loopback_bind(
-        host=settings.http.host,
-        auth_enabled=settings.auth.enabled,
-        allow_unauthenticated_non_loopback=settings.allow_unauthenticated_non_loopback,
-    ):
-        raise typer.BadParameter(  # noqa: TRY003
-            "refusing to bind an unauthenticated Server to a non-loopback address; "
-            "enable authentication, keep the bind on loopback, or set "
-            "POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true to opt in",
-            param_hint="--host",
-        )
+        raise _friendly_bad_parameter(error) from error
     configure_server_logging(settings.logging)
     tracing = configure_server_tracing(settings.tracing)
     try:
@@ -91,6 +102,25 @@ def run(
         )
     finally:
         tracing.shutdown()
+
+
+def _friendly_bad_parameter(error: ValidationError) -> typer.BadParameter:
+    """Translate a settings ``ValidationError`` into an actionable CLI parameter error.
+
+    ``ServerSettings`` enforces its policies at construction time, so a rejected ``--host`` /
+    environment combination arrives here wrapped in pydantic's generic validation report. The
+    policy failures an operator can act on directly are recognised by identity via pydantic's
+    ``ctx['error']`` -- not by matching the raw text -- and translated into a concrete lever.
+    Anything else falls back to pydantic's message unchanged.
+    """
+
+    for detail in error.errors(include_context=True):
+        cause = (detail.get("ctx") or {}).get("error")
+        if isinstance(cause, UnauthenticatedNonLoopbackBindError):
+            return typer.BadParameter(_UNSAFE_BIND_CLI_MESSAGE, param_hint="--host")
+        if isinstance(cause, MissingBearerTokenError):
+            return typer.BadParameter(_MISSING_BEARER_CLI_MESSAGE)
+    return typer.BadParameter(str(error))
 
 
 def _run_server(application: Any, *, host: str, port: int) -> None:

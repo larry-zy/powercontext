@@ -121,14 +121,35 @@ def test_client_allows_a_bearer_token_over_loopback_plaintext() -> None:
     assert client is not None
 
 
-def test_client_allows_a_bearer_token_over_a_caller_supplied_transport() -> None:
-    # A caller-supplied http_client owns its transport (here an in-process ASGI/mock transport), so
-    # the base_url scheme is only a routing label and the plaintext-token guard must not fire.
+def test_client_allows_a_bearer_token_over_a_trusted_caller_supplied_transport() -> None:
+    # A caller-supplied http_client may own a transport whose ``http://`` label is only a routing
+    # token (here an in-process ASGI/mock transport). The caller must vouch for it explicitly with
+    # ``trust_transport_security`` before the plaintext-token guard stands down.
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"})),
     )
-    client = PowerContextClient("http://testserver", token="probe-token", http_client=http_client)  # noqa: S106 - test credential.
+    client = PowerContextClient(
+        "http://testserver",
+        token="probe-token",  # noqa: S106 - test credential.
+        http_client=http_client,
+        trust_transport_security=True,
+    )
     assert client is not None
+
+
+def test_client_refuses_a_bearer_token_over_an_untrusted_caller_supplied_transport() -> None:
+    # Supplying an http_client is not evidence of safety: a shared pooling client (as the LangGraph
+    # adapter installs) points at a real network. Without an explicit trust opt-in the guard must
+    # still refuse to leak the token over non-loopback plaintext.
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"})),
+    )
+    with pytest.raises(ValueError, match="bearer token"):
+        PowerContextClient(
+            "http://memory.example",
+            token="probe-token",  # noqa: S106 - test credential.
+            http_client=http_client,
+        )
 
 
 def test_client_allows_an_unauthenticated_non_loopback_transport() -> None:

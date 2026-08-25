@@ -242,8 +242,55 @@ def test_server_command_rejects_an_unauthenticated_non_loopback_host_override(
         ["server", "run", "--host", "0.0.0.0"],  # noqa: S104 - exercises the non-loopback guard.
     )
 
-    assert result.exit_code != 0
+    assert result.exit_code == 2  # typer.BadParameter, not an unhandled traceback.
     run_server.assert_not_called()
+    # The operator gets the actionable opt-in lever (the full env var), not pydantic's internal dump.
+    assert "--host" in result.output
+    assert "POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true" in result.output
+    assert "pydantic" not in result.output
+
+
+def test_server_command_reports_a_friendly_error_when_auth_lacks_a_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_server = Mock()
+    tracing = Mock()
+    monkeypatch.setattr("powercontext.server.cli._run_server", run_server)
+    monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config: None)
+    monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: tracing)
+    monkeypatch.setenv("POWERCONTEXT_SERVER_AUTH_ENABLED", "true")
+    monkeypatch.delenv("POWERCONTEXT_SERVER_AUTH_TOKEN", raising=False)
+
+    result = CliRunner().invoke(create_cli([server_app]), ["server", "run"])
+
+    assert result.exit_code == 2  # typer.BadParameter, not an unhandled traceback.
+    run_server.assert_not_called()
+    # The operator gets the concrete token / disable levers, not pydantic's internal dump.
+    assert "POWERCONTEXT_SERVER_AUTH_TOKEN" in result.output
+    assert "POWERCONTEXT_SERVER_AUTH_ENABLED=false" in result.output
+    assert "pydantic" not in result.output
+
+
+def test_server_command_lets_a_loopback_override_repair_an_unsafe_environment_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The bind policy must validate the address we actually bind, not the environment value alone: a
+    # safe ``--host 127.0.0.1`` has to repair an unsafe POWERCONTEXT_SERVER_HTTP_HOST=0.0.0.0.
+    run_server = Mock()
+    tracing = Mock()
+    monkeypatch.setattr("powercontext.server.cli._run_server", run_server)
+    monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config: None)
+    monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: tracing)
+    monkeypatch.setenv("POWERCONTEXT_SERVER_HTTP_HOST", "0.0.0.0")  # noqa: S104 - unsafe env value the CLI repairs.
+
+    result = CliRunner().invoke(
+        create_cli([server_app]),
+        ["server", "run", "--host", "127.0.0.1"],
+    )
+
+    assert result.exit_code == 0
+    run_server.assert_called_once()
+    assert run_server.call_args.kwargs["host"] == "127.0.0.1"
 
 
 def test_server_command_does_not_load_client_settings(monkeypatch: pytest.MonkeyPatch) -> None:
