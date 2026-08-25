@@ -36,6 +36,7 @@ from pydantic import ValidationError
 
 from powercontext.http import HealthResponse, ReadinessResponse, ReadinessStatus
 from powercontext.paths import powercontext_data_dir
+from powercontext.transport import is_loopback_host
 
 HELP_OPTION_NAMES = ("-h", "--help")
 DEFAULT_MARKETPLACE_SOURCE = "oceanbase/powercontext"
@@ -43,7 +44,6 @@ DEFAULT_MARKETPLACE_REF = "master"
 PLUGIN_NAME = "powercontext"
 CLAUDE_MARKETPLACE_NAME = "powercontext"
 _GITHUB_REPOSITORY = re.compile(r"^[^/\s]+/[^/\s]+$")
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 setup_app = typer.Typer(
     name="setup",
@@ -1007,7 +1007,7 @@ def _normalize_claude_server_url(value: str) -> str:
         raise SetupError.claude_server_url_scheme()
     if parsed.query or parsed.fragment:
         raise SetupError.claude_server_url_suffix()
-    if parsed.scheme == "http" and parsed.hostname.lower() not in _LOOPBACK_HOSTS:
+    if parsed.scheme == "http" and not is_loopback_host(parsed.hostname):
         raise SetupError.claude_server_url_transport()
     path = parsed.path.rstrip("/")
     if path.endswith("/mcp"):

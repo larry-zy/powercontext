@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared network transport-policy contract across Client, CLI, Server, and the Codex plugin."""
+"""Shared network transport-policy contract across Client, CLI, Server, and the agent plugins."""
 
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -31,33 +32,47 @@ from powercontext.transport import LOOPBACK_HOSTS, is_loopback_host, is_plaintex
 
 _ALL_INTERFACES = "0.0.0.0"  # noqa: S104 - a non-loopback bind used to exercise the policy.
 
-# The Codex plugin ships as an isolated package (it only depends on pydantic-settings) and cannot
-# import powercontext, so it keeps its own copy of the loopback policy. Load it by path to pin that
-# copy to the shared contract and catch drift the two implementations could otherwise hide.
-_CODEX_SETTINGS_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "integrations"
-    / "codex"
-    / "plugins"
-    / "powercontext"
-    / "settings.py"
-)
+# Both agent plugins ship isolated (they do not depend on powercontext) and each vendors its own
+# copy of the loopback policy. Load every copy by path and pin it to the shared contract so drift in
+# any one implementation is caught. Loading is defensive: a moved path or a plugin import error
+# skips that plugin's drift guard rather than failing collection for the whole module.
+_INTEGRATIONS = Path(__file__).resolve().parent.parent / "integrations"
+_VENDORED_PLUGIN_PATHS = {
+    "codex": _INTEGRATIONS / "codex" / "plugins" / "powercontext" / "settings.py",
+    "claude-code": _INTEGRATIONS / "claude-code" / "plugins" / "powercontext" / "claude_code_settings.py",
+}
 
 
-def _load_codex_settings() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("codex_plugin_settings", _CODEX_SETTINGS_PATH)
+def _load_plugin_module(name: str, path: Path) -> tuple[ModuleType | None, str]:
+    module_name = f"vendored_plugin_{name}".replace("-", "_")
+    spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    # Register before executing: a slotted dataclass (the Claude Code plugin) resolves its own
+    # module via sys.modules during class creation and fails to import otherwise.
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:  # pragma: no cover - exercised only when a plugin is unavailable.
+        sys.modules.pop(module_name, None)
+        return None, repr(error)
+    return module, ""
 
 
-_CODEX_SETTINGS = _load_codex_settings()
+_VENDORED_PLUGINS = {name: _load_plugin_module(name, path) for name, path in _VENDORED_PLUGIN_PATHS.items()}
+_VENDORED_PLUGIN_PARAMS = [
+    pytest.param(
+        module,
+        id=name,
+        marks=pytest.mark.skipif(module is None, reason=f"{name} plugin unavailable: {error}"),
+    )
+    for name, (module, error) in _VENDORED_PLUGINS.items()
+]
 
 
 @pytest.mark.parametrize(
     "host",
-    ["127.0.0.1", "localhost", "LOCALHOST", "::1", "[::1]"],
+    ["127.0.0.1", "127.0.0.2", "127.1.2.3", "localhost", "LOCALHOST", "::1", "[::1]"],
 )
 def test_loopback_hosts_are_recognized(host: str) -> None:
     assert is_loopback_host(host)
@@ -140,22 +155,32 @@ def test_server_allows_a_non_loopback_bind_with_an_explicit_opt_in() -> None:
     assert settings.allow_unauthenticated_non_loopback is True
 
 
-def test_codex_plugin_shares_the_loopback_host_set() -> None:
-    assert _CODEX_SETTINGS._LOOPBACK_HOSTS == LOOPBACK_HOSTS
+@pytest.mark.parametrize("plugin", _VENDORED_PLUGIN_PARAMS)
+def test_vendored_plugin_shares_the_loopback_host_set(plugin: ModuleType) -> None:
+    assert plugin._LOOPBACK_HOSTS == LOOPBACK_HOSTS
 
 
+@pytest.mark.parametrize("plugin", _VENDORED_PLUGIN_PARAMS)
 @pytest.mark.parametrize(
     "host",
-    ["127.0.0.1", "localhost", "[::1]", _ALL_INTERFACES, "memory.example", "192.168.1.10"],
+    [
+        "127.0.0.1",
+        "127.0.0.2",
+        "localhost",
+        "[::1]",
+        _ALL_INTERFACES,
+        "memory.example",
+        "192.168.1.10",
+    ],
 )
-def test_codex_plugin_matches_the_shared_plaintext_policy(host: str) -> None:
-    """The Codex plugin's own loopback check must agree with the shared transport contract."""
+def test_vendored_plugin_matches_the_shared_plaintext_policy(plugin: ModuleType, host: str) -> None:
+    """Each plugin's vendored loopback check must agree with the shared transport contract."""
 
     base_url = f"http://{host}:8000"
     transport_rejects = is_plaintext_non_loopback(base_url)
     try:
-        _CODEX_SETTINGS._http_base_url(f"{base_url}/mcp")
-        codex_rejects = False
+        plugin._http_base_url(f"{base_url}/mcp")
+        plugin_rejects = False
     except ValueError:
-        codex_rejects = True
-    assert codex_rejects == transport_rejects
+        plugin_rejects = True
+    assert plugin_rejects == transport_rejects

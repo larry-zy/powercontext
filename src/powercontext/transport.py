@@ -23,17 +23,21 @@ Server must not bind to a routable address without an explicit opt-in.
 
 from __future__ import annotations
 
+import ipaddress
 from urllib.parse import urlsplit
 
-#: Hosts for which unencrypted HTTP is considered safe.
+#: Named hosts for which unencrypted HTTP is always considered safe. IP literals
+#: are additionally accepted whenever they fall inside a loopback range -- for
+#: IPv4 that is the whole ``127.0.0.0/8`` block, not just ``127.0.0.1``.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 def is_loopback_host(host: str | None) -> bool:
     """Return whether ``host`` names a loopback interface.
 
-    Accepts bare hostnames (``localhost``), IPv4 literals (``127.0.0.1``), and
-    IPv6 literals with or without brackets (``::1`` / ``[::1]``).
+    Accepts bare hostnames (``localhost``), IPv4 literals anywhere in the
+    ``127.0.0.0/8`` block (``127.0.0.1``, ``127.0.0.2``, ...), and IPv6 loopback
+    literals with or without brackets (``::1`` / ``[::1]``).
     """
 
     if not host:
@@ -41,7 +45,12 @@ def is_loopback_host(host: str | None) -> bool:
     normalized = host.strip().lower()
     if normalized.startswith("[") and normalized.endswith("]"):
         normalized = normalized[1:-1]
-    return normalized in LOOPBACK_HOSTS
+    if normalized in LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def is_plaintext_non_loopback(url: str) -> bool:

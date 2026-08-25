@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 import typer
+from pydantic import ValidationError
 
 from powercontext.server.factory import create_server_app
 from powercontext.server.logging import configure_server_logging
@@ -51,7 +52,10 @@ def run(
 ) -> None:
     """Run the ASGI service in the foreground."""
 
-    environment = ServerSettings()
+    try:
+        environment = ServerSettings()
+    except ValidationError as error:
+        raise typer.BadParameter(str(error)) from error
     http = HttpConfig(
         host=environment.http.host if host is None else host,
         port=environment.http.port if port is None else port,

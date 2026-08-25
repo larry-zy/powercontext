@@ -52,11 +52,7 @@ def is_unauthenticated_non_loopback_bind(
 ) -> bool:
     """Return whether a bind exposes an unauthenticated Server off loopback."""
 
-    return (
-        not is_loopback_host(host)
-        and not auth_enabled
-        and not allow_unauthenticated_non_loopback
-    )
+    return not is_loopback_host(host) and not auth_enabled and not allow_unauthenticated_non_loopback
 
 
 class HttpConfig(BaseModel):
