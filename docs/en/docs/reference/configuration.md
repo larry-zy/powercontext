@@ -64,8 +64,10 @@ upstream or the network is otherwise controlled, set `POWERCONTEXT_SERVER_ALLOW_
 opt in explicitly. Use TLS before exposing an authenticated Server over a network.
 
 The Python Client and CLI apply the matching rule for outbound requests: a configured unencrypted `http://` Server URL is
-accepted only for loopback hosts, and the Client refuses to send a bearer token over an unencrypted non-loopback
-connection.
+accepted only for loopback hosts, and the Client refuses to send any request -- authenticated or not -- over unencrypted
+non-loopback HTTP. Code whose `http://` base URL is only a routing label for a transport that is secure in practice (an
+in-process ASGI app, a Unix-domain socket, or a proxy that terminates TLS) must supply its own `http_client` and pass
+`trust_transport_security=True` explicitly.
 
 The Dashboard is enabled by default and shares the Server listener and port with the HTTP API and MCP. With no scopes
 configured, the page shows an empty state. Dashboard initialization failures are logged with their direct cause and do

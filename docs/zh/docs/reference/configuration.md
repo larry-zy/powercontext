@@ -63,7 +63,9 @@ readiness endpoint 仍然公开。明文 HTTP 仅在 loopback 地址（`127.0.0.
 Server 前必须配置 TLS。
 
 Python Client 和 CLI 对出站请求应用相同规则：配置的明文 `http://` Server URL 仅接受 loopback 主机，并且 Client 拒绝
-通过明文的非 loopback 连接发送 Bearer token。
+通过明文的非 loopback HTTP 发送任何请求——无论是否携带 Bearer token。当代码的 `http://` base URL 只是路由标签、
+实际传输是安全的（进程内 ASGI 应用、Unix domain socket、由代理终止 TLS）时，必须自行传入 `http_client` 并显式设置
+`trust_transport_security=True`。
 
 Dashboard 默认启用，并与 HTTP API、MCP 共用监听地址和端口。默认未配置 scope，页面会显示空状态；Dashboard
 初始化失败只记录包含直接原因的 warning，不影响 Server 的 HTTP API、MCP 和健康检查启动。
