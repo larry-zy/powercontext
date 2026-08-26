@@ -103,7 +103,7 @@ export POWERCONTEXT_SERVER_RUNTIME_MEMORY_RERANK_CANDIDATE_LIMIT=30
 Rerank 默认关闭。启用后，Runtime 会召回并融合配置的候选池，再使用 temperature 为 0 的 generation model，选择不超过
 search request 最终 `limit` 的结果。它不会修改已存储 Memory 或索引。Provider 与结构化输出失败仍作为 inference error
 显式返回；如果搜索必须独立于模型可用性，请关闭 rerank。算法、并发与 API 边界见
-[RFC 0080](../../rfcs/0080_memory_search_reranking.md)。
+[RFC 0080](/zh/rfcs/0080_memory_search_reranking/)。
 
 同一个 generation model 也控制显式 Experience generation、managed Skill generation/evolution，以及
 external Skill import/fork。未配置模型时，这些 operation 会在持久化 Candidate 前返回 capability error；

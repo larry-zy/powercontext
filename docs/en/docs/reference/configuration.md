@@ -108,7 +108,7 @@ Reranking is disabled by default. When enabled, the Runtime retrieves and fuses 
 uses the generation model at temperature zero to select no more than the search request's final `limit`. It does not
 change stored Memory or indexes. Provider and structured-output failures remain visible as inference errors; disable
 reranking when search must remain independent of model availability. See
-[RFC 0080](../../rfcs/0080_memory_search_reranking.md) for the algorithm, concurrency, and API boundaries.
+[RFC 0080](/en/rfcs/0080_memory_search_reranking/) for the algorithm, concurrency, and API boundaries.
 
 The same configured generation model gates explicit Experience generation, managed Skill generation and evolution,
 and external Skill import or fork. Without it, these operations return a capability error before persisting a
