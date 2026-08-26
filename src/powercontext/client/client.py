@@ -189,18 +189,20 @@ class PowerContextClient:
         trust_transport_security: bool = False,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        # Plaintext HTTP only carries a bearer token safely on loopback. When this facade opens the
-        # transport itself, ``base_url``'s scheme accurately reflects what crosses the wire. A
-        # caller-supplied ``http_client`` *may* instead own a transport whose ``http://`` label is
-        # only a routing token -- an in-process ASGI app, a Unix socket, or a TLS-terminating proxy
-        # -- but a plain pooling ``httpx.AsyncClient`` (e.g. the shared client the LangGraph adapter
-        # installs) is exactly as exposed as one we would open ourselves. Supplying a transport is
-        # therefore not evidence of safety: the guard stays on for caller-supplied transports too,
-        # and a caller that knows its transport is secure must say so explicitly via
-        # ``trust_transport_security`` rather than have safety inferred from the argument being set.
+        # Plaintext HTTP is only trusted on loopback -- for *any* request, not just an authenticated
+        # one. The request body itself carries Memory content, so a missing bearer token does not make
+        # an unencrypted non-loopback request safe. When this facade opens the transport itself,
+        # ``base_url``'s scheme accurately reflects what crosses the wire. A caller-supplied
+        # ``http_client`` *may* instead own a transport whose ``http://`` label is only a routing
+        # token -- an in-process ASGI app, a Unix socket, or a TLS-terminating proxy -- but a plain
+        # pooling ``httpx.AsyncClient`` (e.g. the shared client the LangGraph adapter installs) is
+        # exactly as exposed as one we would open ourselves. Supplying a transport is therefore not
+        # evidence of safety: the guard stays on for caller-supplied transports too, and a caller that
+        # knows its transport is secure must say so explicitly via ``trust_transport_security`` rather
+        # than have safety inferred from the argument being set.
         transport_trusted = http_client is not None and trust_transport_security
-        if token and not transport_trusted and is_plaintext_non_loopback(self._base_url):
-            raise ValueError("refusing to send a bearer token over unencrypted non-loopback HTTP")  # noqa: TRY003
+        if not transport_trusted and is_plaintext_non_loopback(self._base_url):
+            raise ValueError("refusing to send requests over unencrypted non-loopback HTTP")  # noqa: TRY003
         self._headers = {"Authorization": f"Bearer {token}"} if token else None
         self._owned_http_client: httpx.AsyncClient | None = None
         if http_client is None:

@@ -116,10 +116,19 @@ def test_client_settings_accept_loopback_or_tls_urls(server_url: str) -> None:
     assert ClientSettings(server_url=server_url).server_url.startswith(("http://", "https://"))
 
 
+def test_client_refuses_requests_over_non_loopback_plaintext() -> None:
+    # The public constructor is a transport surface in its own right: even without a bearer token the
+    # request body carries Memory content, so a plaintext non-loopback base URL must be refused. This
+    # is the ``capture_content_source`` probe from the #1319 acceptance -- the facade must not open
+    # such a transport itself.
+    with pytest.raises(ValueError, match="non-loopback"):
+        PowerContextClient("http://memory.example")
+
+
 def test_client_refuses_a_bearer_token_over_non_loopback_plaintext() -> None:
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"}))
     with httpx.Client(transport=transport):  # noqa: SIM117 - guard runs before any request.
-        with pytest.raises(ValueError, match="bearer token"):
+        with pytest.raises(ValueError, match="non-loopback"):
             PowerContextClient("http://memory.example", token="probe-token")  # noqa: S106 - test credential.
 
 
@@ -128,10 +137,11 @@ def test_client_allows_a_bearer_token_over_loopback_plaintext() -> None:
     assert client is not None
 
 
-def test_client_allows_a_bearer_token_over_a_trusted_caller_supplied_transport() -> None:
+def test_client_allows_a_trusted_caller_supplied_transport() -> None:
     # A caller-supplied http_client may own a transport whose ``http://`` label is only a routing
     # token (here an in-process ASGI/mock transport). The caller must vouch for it explicitly with
-    # ``trust_transport_security`` before the plaintext-token guard stands down.
+    # ``trust_transport_security`` before the plaintext guard stands down; this covers the
+    # authenticated e2e flow.
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"})),
     )
@@ -151,7 +161,7 @@ def test_client_refuses_a_bearer_token_over_an_untrusted_caller_supplied_transpo
     http_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"})),
     )
-    with pytest.raises(ValueError, match="bearer token"):
+    with pytest.raises(ValueError, match="non-loopback"):
         PowerContextClient(
             "http://memory.example",
             token="probe-token",  # noqa: S106 - test credential.
@@ -159,13 +169,15 @@ def test_client_refuses_a_bearer_token_over_an_untrusted_caller_supplied_transpo
         )
 
 
-def test_client_allows_an_unauthenticated_non_loopback_transport() -> None:
-    async def respond(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"status": "ok"})
-
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-    client = PowerContextClient("http://testserver", http_client=http_client)
-    assert client is not None
+def test_client_refuses_an_unauthenticated_untrusted_non_loopback_transport() -> None:
+    # The guard is not gated on a token: an untrusted caller-supplied transport to a non-loopback
+    # plaintext host must be refused even with no credentials, because the Memory content in the body
+    # still crosses the wire in the clear.
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"}))
+    )
+    with pytest.raises(ValueError, match="non-loopback"):
+        PowerContextClient("http://memory.example", http_client=http_client)
 
 
 def test_server_rejects_an_unauthenticated_non_loopback_bind() -> None:
