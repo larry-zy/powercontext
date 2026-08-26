@@ -20,7 +20,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,6 +70,34 @@ class PowerContextSettings(Settings):
     trust_transport_security: bool = False
 
 
+def open_client(
+    base_url: str,
+    *,
+    timeout: float,
+    trust_transport_security: bool = False,
+) -> AbstractAsyncContextManager[PowerContextClient]:
+    """Open a client, vouching for the transport only when the operator opted in."""
+
+    if trust_transport_security:
+        return _vouched_client(base_url, timeout)
+    return PowerContextClient(base_url, timeout=timeout)
+
+
+@asynccontextmanager
+async def _vouched_client(base_url: str, timeout_seconds: float) -> AsyncIterator[PowerContextClient]:
+    # The operator vouched for the network (e.g. a private Compose bridge), and the
+    # client only honours that vouch for a caller-supplied transport.
+    async with (
+        httpx.AsyncClient(timeout=timeout_seconds) as transport,
+        PowerContextClient(
+            base_url,
+            http_client=transport,
+            trust_transport_security=True,
+        ) as client,
+    ):
+        yield client
+
+
 class PowerContextPlugin:
     """Bub hooks backed by the public PowerContext client."""
 
@@ -87,6 +115,7 @@ class PowerContextPlugin:
                 "base_url": self.base_url,
                 "scope_id": self.scope_id,
                 "timeout": self.settings.timeout,
+                "trust_transport_security": self.settings.trust_transport_security,
                 "capture_sequence": 0,
                 "captured_events": 0,
                 "captured_position": 0,
@@ -170,23 +199,12 @@ class PowerContextPlugin:
         async with self._capture_lock:
             await self._flush_captured_sources(state, final=True)
 
-    @asynccontextmanager
-    async def _client(self) -> AsyncIterator[PowerContextClient]:
-        if self.settings.trust_transport_security:
-            # The operator vouched for the network (e.g. a private Compose bridge), and the
-            # client only honours that vouch for a caller-supplied transport.
-            async with (
-                httpx.AsyncClient(timeout=self.settings.timeout) as transport,
-                PowerContextClient(
-                    self.base_url,
-                    http_client=transport,
-                    trust_transport_security=True,
-                ) as client,
-            ):
-                yield client
-            return
-        async with PowerContextClient(self.base_url, timeout=self.settings.timeout) as client:
-            yield client
+    def _client(self) -> AbstractAsyncContextManager[PowerContextClient]:
+        return open_client(
+            self.base_url,
+            timeout=self.settings.timeout,
+            trust_transport_security=self.settings.trust_transport_security,
+        )
 
     async def _prepare_context(self, query: str, state: TurnState) -> str | None:
         request = PrepareContextRequest(
