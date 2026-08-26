@@ -58,10 +58,10 @@ Server settings use the `POWERCONTEXT_SERVER_` prefix.
 
 Static bearer authentication is disabled by default. When enabled, API and MCP requests must include
 `Authorization: Bearer <token>`; the liveness and readiness endpoints remain public. Plain HTTP is trusted only on a
-loopback address (`127.0.0.1`, `localhost`, `::1`). The Server refuses to start when it binds to a non-loopback address
-while authentication is disabled; either enable authentication, keep the bind on loopback, or, when TLS is terminated
-upstream or the network is otherwise controlled, set `POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true` to
-opt in explicitly. Use TLS before exposing an authenticated Server over a network.
+loopback address (`localhost`, `::1`, or any address in `127.0.0.0/8`). The Server refuses to start when it binds to a
+non-loopback address while authentication is disabled; either enable authentication, keep the bind on loopback, or,
+when TLS is terminated upstream or the network is otherwise controlled, set
+`POWERCONTEXT_SERVER_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true` to opt in explicitly. Use TLS before exposing an authenticated Server over a network.
 
 The Python Client and CLI apply the matching rule for outbound requests: a configured unencrypted `http://` Server URL is
 accepted only for loopback hosts, and the Client refuses to send any request -- authenticated or not -- over unencrypted

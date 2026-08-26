@@ -80,6 +80,7 @@ Client and can automatically prepend bounded `PreparedContext`. Optional capture
 model and completed tool events, performs checkpoint Flush, and flushes remaining Sources after the run. MCP needs no
 adapter package but does not provide automatic context preparation, capture, or Flush. See
 [Configure Pydantic AI](../how-to/configure-pydantic-ai.md).
+
 ## LangGraph adapter
 
 `powercontext-langgraph` connects a LangGraph graph to a running Server through the public Python Client. It supplies

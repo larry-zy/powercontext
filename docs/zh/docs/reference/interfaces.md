@@ -71,6 +71,7 @@ project-context skill 指导 DeepSeek Harness 何时检索、记忆、修订或�
 `PreparedContext`。可选 Capture 会保存经过清洗和限长的可见模型事件与已完成工具事件，执行 checkpoint Flush，并在
 run 结束后 Flush 剩余 Source。MCP 不需要适配器包，但不提供自动 Context 准备、Capture 或 Flush。参见
 [配置 Pydantic AI](../how-to/configure-pydantic-ai.md)。
+
 ## LangGraph 适配器
 
 `powercontext-langgraph` 通过公开的 Python Client 把 LangGraph 图连接到运行中的 Server，提供三个组件：
