@@ -1685,6 +1685,7 @@ version = "0.0.1"
 source = { editable = "../../integrations/bub" }
 dependencies = [
     { name = "bub" },
+    { name = "httpx" },
     { name = "powercontext", extra = ["client"] },
     { name = "pydantic-settings" },
 ]
@@ -1692,6 +1693,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "bub", specifier = ">=0.4.0,<0.5.0" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "powercontext", extras = ["client"], specifier = ">=0.0.1" },
     { name = "pydantic-settings", specifier = ">=2.7,<3" },
 ]

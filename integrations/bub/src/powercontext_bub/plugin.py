@@ -20,11 +20,14 @@ import asyncio
 import hashlib
 import json
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 from bub import Settings, config, ensure_config, hookimpl
 from bub.hooks.interception import LlmCallRequest, LlmCallResult, ToolCall, ToolCallResult
 from bub.turn import TurnState
@@ -65,6 +68,7 @@ class PowerContextSettings(Settings):
     capture_checkpoint_every: int = Field(default=5, ge=1, le=100)
     capture_max_bytes: int = Field(default=8192, ge=512, le=32768)
     capture_log: Path | None = None
+    trust_transport_security: bool = False
 
 
 class PowerContextPlugin:
@@ -167,6 +171,24 @@ class PowerContextPlugin:
         async with self._capture_lock:
             await self._flush_captured_sources(state, final=True)
 
+    @asynccontextmanager
+    async def _client(self) -> AsyncIterator[PowerContextClient]:
+        if self.settings.trust_transport_security:
+            # The operator vouched for the network (e.g. a private Compose bridge), and the
+            # client only honours that vouch for a caller-supplied transport.
+            async with (
+                httpx.AsyncClient(timeout=self.settings.timeout) as transport,
+                PowerContextClient(
+                    self.base_url,
+                    http_client=transport,
+                    trust_transport_security=True,
+                ) as client,
+            ):
+                yield client
+            return
+        async with PowerContextClient(self.base_url, timeout=self.settings.timeout) as client:
+            yield client
+
     async def _prepare_context(self, query: str, state: TurnState) -> str | None:
         request = PrepareContextRequest(
             scope_id=self.scope_id,
@@ -174,7 +196,7 @@ class PowerContextPlugin:
             max_bytes=self.settings.max_bytes,
         )
         try:
-            async with PowerContextClient(self.base_url, timeout=self.settings.timeout) as client:
+            async with self._client() as client:
                 prepared = await client.prepare_context(request)
         except CLIENT_ERRORS as exc:
             state[STATE_KEY]["prepare_error"] = type(exc).__name__
@@ -223,7 +245,7 @@ class PowerContextPlugin:
                 },
             )
             try:
-                async with PowerContextClient(self.base_url, timeout=self.settings.timeout) as client:
+                async with self._client() as client:
                     response = await client.capture_content_source(request)
             except CLIENT_ERRORS as exc:
                 self._write_capture_record(
@@ -254,7 +276,7 @@ class PowerContextPlugin:
             return
 
         try:
-            async with PowerContextClient(self.base_url, timeout=self.settings.timeout) as client:
+            async with self._client() as client:
                 response = await client.flush_memory(FlushMemoryRequest(scope_id=self.scope_id))
         except CLIENT_ERRORS as exc:
             self._write_capture_record(
