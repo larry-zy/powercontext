@@ -22,6 +22,7 @@ nav = [
                 { "Review Candidates" = "en/docs/how-to/review-candidates.md" },
                 { "Create and review an Experience" = "en/docs/how-to/create-and-review-experience.md" },
                 { "Create and export a managed Skill" = "en/docs/how-to/create-and-export-skill.md" },
+                { "Export and restore a portable archive" = "en/docs/how-to/portable-archive.md" },
                 { "Troubleshoot" = "en/docs/how-to/troubleshoot.md" },
             ] },
             { "Integrations" = [
@@ -97,6 +98,7 @@ nav = [
                 { "审核 Candidate" = "zh/docs/how-to/review-candidates.md" },
                 { "创建并审核 Experience" = "zh/docs/how-to/create-and-review-experience.md" },
                 { "创建并导出 managed Skill" = "zh/docs/how-to/create-and-export-skill.md" },
+                { "导出和恢复可移植归档" = "zh/docs/how-to/portable-archive.md" },
                 { "排查问题" = "zh/docs/how-to/troubleshoot.md" },
             ] },
             { "集成方式" = [

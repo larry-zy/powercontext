@@ -48,6 +48,9 @@ overview:
         - title: 创建 managed Skill
           description: 生成并审核 managed Skill，再将一个精确 Revision 导出给 Codex。
           href: zh/docs/how-to/create-and-export-skill/
+        - title: 可移植归档
+          description: 创建经过校验的本地逻辑备份，验证后恢复完整 scope。
+          href: zh/docs/how-to/portable-archive/
         - title: 排查问题
           description: 诊断连接、配置和集成问题。
           href: zh/docs/how-to/troubleshoot/

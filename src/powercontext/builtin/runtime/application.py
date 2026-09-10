@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
     from powercontext.builtin.handoff_report.application import HandoffReportApplication
+    from powercontext.builtin.portability import PortableBundleService
 
 logger = logging.getLogger(__name__)
 
@@ -1194,6 +1195,7 @@ class BuiltinRuntime:
         readiness: RuntimeReadinessChecks | None = None,
         clock: Clock | None = None,
         tracing: RuntimeTracing | None = None,
+        archive_service: PortableBundleService | None = None,
     ) -> None:
         if source_window_limit < 1:
             raise _RuntimeConfigurationError("source_window_limit")
@@ -1237,6 +1239,7 @@ class BuiltinRuntime:
         self.review = ReviewApplication(self)
         self.skill = SkillApplication(self)
         self.statistics = StatisticsApplication(self)
+        self.archive = archive_service
         self.handoff_report: HandoffReportApplication | None = None
         self.processor = None if scope_ids is None else ScheduledSourceProcessor(self, scope_ids)
         self.experience_processor = (

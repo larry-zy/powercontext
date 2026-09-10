@@ -987,7 +987,7 @@ name = "importlib-metadata"
 version = "9.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "zipp" },
+    { name = "zipp", marker = "python_full_version < '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a9/01/15bb152d77b21318514a96f43af312635eb2500c96b55398d020c93d86ea/importlib_metadata-9.0.0.tar.gz", hash = "sha256:a4f57ab599e6a2e3016d7595cfd72eb4661a5106e787a95bcc90c7105b831efc", size = 56405, upload-time = "2026-03-20T06:42:56.999Z" }
 wheels = [
@@ -2074,10 +2074,16 @@ builtin = [
     { name = "sqlite-vec" },
 ]
 cli = [
+    { name = "aiosqlite" },
+    { name = "apscheduler" },
     { name = "httpx", extra = ["socks"] },
     { name = "opentelemetry-api" },
     { name = "platformdirs" },
+    { name = "pydantic-ai-slim", extra = ["anthropic", "openai"] },
     { name = "pydantic-settings" },
+    { name = "pyobvector" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "sqlite-vec" },
     { name = "typer" },
 ]
 client = [
@@ -2140,9 +2146,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", marker = "extra == 'builtin'", specifier = ">=0.22,<1" },
+    { name = "aiosqlite", marker = "extra == 'cli'", specifier = ">=0.22,<1" },
     { name = "aiosqlite", marker = "extra == 'seekdb'", specifier = ">=0.22,<1" },
     { name = "aiosqlite", marker = "extra == 'server'", specifier = ">=0.22,<1" },
     { name = "apscheduler", marker = "extra == 'builtin'", specifier = ">=3.11,<4" },
+    { name = "apscheduler", marker = "extra == 'cli'", specifier = ">=3.11,<4" },
     { name = "apscheduler", marker = "extra == 'seekdb'", specifier = ">=3.11,<4" },
     { name = "apscheduler", marker = "extra == 'server'", specifier = ">=3.11,<4" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115,<1" },
@@ -2160,6 +2168,7 @@ requires-dist = [
     { name = "prometheus-client", marker = "extra == 'server'", specifier = ">=0.21,<1" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "pydantic-ai-slim", extras = ["anthropic", "openai"], marker = "extra == 'builtin'", specifier = ">=2.27.1,<3" },
+    { name = "pydantic-ai-slim", extras = ["anthropic", "openai"], marker = "extra == 'cli'", specifier = ">=2.27.1,<3" },
     { name = "pydantic-ai-slim", extras = ["anthropic", "openai"], marker = "extra == 'seekdb'", specifier = ">=2.27.1,<3" },
     { name = "pydantic-ai-slim", extras = ["anthropic", "openai"], marker = "extra == 'server'", specifier = ">=2.27.1,<3" },
     { name = "pydantic-settings", marker = "extra == 'builtin'", specifier = ">=2.7,<3" },
@@ -2169,13 +2178,16 @@ requires-dist = [
     { name = "pydantic-settings", marker = "extra == 'server'", specifier = ">=2.7,<3" },
     { name = "pylibseekdb", marker = "(sys_platform == 'darwin' and extra == 'seekdb') or (sys_platform == 'linux' and extra == 'seekdb')", specifier = ">=1.3.0.post4,<2" },
     { name = "pyobvector", marker = "extra == 'builtin'", specifier = ">=0.2.28,<0.3" },
+    { name = "pyobvector", marker = "extra == 'cli'", specifier = ">=0.2.28,<0.3" },
     { name = "pyobvector", marker = "extra == 'seekdb'", specifier = ">=0.2.28,<0.3" },
     { name = "pyobvector", marker = "extra == 'server'", specifier = ">=0.2.28,<0.3" },
     { name = "rfc8785", specifier = ">=0.1.4,<1" },
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'builtin'", specifier = ">=2,<3" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'cli'", specifier = ">=2,<3" },
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'seekdb'", specifier = ">=2,<3" },
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'server'", specifier = ">=2,<3" },
     { name = "sqlite-vec", marker = "extra == 'builtin'", specifier = ">=0.1.9,<0.2" },
+    { name = "sqlite-vec", marker = "extra == 'cli'", specifier = ">=0.1.9,<0.2" },
     { name = "sqlite-vec", marker = "extra == 'seekdb'", specifier = ">=0.1.9,<0.2" },
     { name = "sqlite-vec", marker = "extra == 'server'", specifier = ">=0.1.9,<0.2" },
     { name = "typer", marker = "extra == 'cli'", specifier = ">=0.16,<1" },

@@ -77,6 +77,7 @@ from powercontext.builtin.persistence.memory_index import MemoryIndex, NoMemoryI
 from powercontext.builtin.persistence.sources import SourceRepository, StoredSource
 from powercontext.builtin.persistence.statistics import StatisticsRepository
 from powercontext.builtin.persistence.tables import ARTIFACT_HEADS_TABLE, SOURCE_JOURNAL_HEADS_TABLE
+from powercontext.builtin.portability import PortableBundleService
 from powercontext.builtin.review.generation import (
     GeneratedCandidateResult,
     GenerationCapabilityUnavailableError,
@@ -305,6 +306,12 @@ class RelationalContexts:
         memory_artifact_id: str = "memory",
     ) -> None:
         self.database = database
+        self.portability = PortableBundleService(
+            database,
+            projection_rebuilder=self.rebuild_portable_projections,
+            supported_source_types=tuple(adapter.name for adapter in _SOURCE_ADAPTERS),
+            supported_artifact_families=(Handoff.family, Memory.family, Experience.family, Skill.family),
+        )
         self.index = NoMemoryIndex() if index is None else index
         self.experience_index = NoExperienceIndex() if experience_index is None else experience_index
         self.repositories = _Repositories(
@@ -457,6 +464,16 @@ class RelationalContexts:
                 )
             ).scalars()
             return tuple(str(value) for value in values)
+
+    async def rebuild_portable_projections(self, scope_ids: tuple[str, ...], /) -> None:
+        """Rebuild target-local search projections after a logical restore."""
+
+        for scope_id in scope_ids:
+            services = self._services_for(scope_id)
+            _, catalog = services.sources()
+            await services.memory(catalog).rebuild_projections()
+        async with self.database.transaction() as connection:
+            await self.experience_index.initialize(connection)
 
     async def incubate_experience(self, scope_id: str, limit: int, /) -> ExperienceIncubationResult:
         """Process one independent Task Outcome Source window for Review."""

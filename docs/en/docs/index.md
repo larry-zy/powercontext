@@ -48,6 +48,9 @@ overview:
         - title: Create a managed Skill
           description: Generate and review a managed Skill, then export one exact Revision to Codex.
           href: en/docs/how-to/create-and-export-skill/
+        - title: Portable archive
+          description: Create a verified local logical backup, validate it, and restore complete scopes.
+          href: en/docs/how-to/portable-archive/
         - title: Troubleshoot
           description: Diagnose connection, configuration, and integration problems.
           href: en/docs/how-to/troubleshoot/
