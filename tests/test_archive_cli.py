@@ -39,6 +39,23 @@ def test_archive_cli_can_export_inspect_and_dry_run_an_empty_scope(tmp_path, mon
     assert validated.exit_code == 0, validated.output
 
 
+def test_inspect_and_dry_run_do_not_create_target_database(tmp_path, monkeypatch) -> None:
+    source_home = tmp_path / "source"
+    monkeypatch.setenv("POWERCONTEXT_HOME", str(source_home))
+    archive = tmp_path / "scope.pcb"
+    cli = create_cli([archive_app])
+    runner = CliRunner()
+    assert (
+        runner.invoke(cli, ["archive", "export", "--scope-id", "project:one", "--output", str(archive)]).exit_code == 0
+    )
+    target_home = tmp_path / "unused-target"
+    monkeypatch.setenv("POWERCONTEXT_HOME", str(target_home))
+    for arguments in (["inspect", str(archive)], ["restore", str(archive), "--dry-run"]):
+        result = runner.invoke(cli, ["archive", *arguments])
+        assert result.exit_code == 0, result.output
+        assert not target_home.exists()
+
+
 def test_archive_cli_reports_corrupt_or_missing_bundles_without_a_traceback() -> None:
     result = CliRunner().invoke(create_cli([archive_app]), ["archive", "inspect", "missing.pcb"])
 

@@ -10,7 +10,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from powercontext.builtin.artifacts.memory import MemoryEntryInput
+from powercontext.builtin.artifacts.memory import EmbeddingProfile, MemoryEntryInput
+from powercontext.builtin.inference import EmbeddingResult
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import (
     BuiltinConfig,
@@ -19,6 +20,7 @@ from powercontext.builtin.runtime import (
     HandoffSourceCitation,
     HandoffStatement,
     RememberMemoryRequest,
+    open_builtin_contexts,
     open_builtin_runtime,
 )
 
@@ -76,5 +78,40 @@ def test_sqlite_portable_archive_restores_revisions_lineage_and_handoff_receipts
             assert latest is not None
             assert latest.revision == 1
             assert latest.lineage.sources == (source.source_ref,)
+
+    asyncio.run(scenario())
+
+
+class _ArchiveEmbeddingModel:
+    profile = EmbeddingProfile(
+        profile_id="archive-test", model="test", dimension=3, distance="l2", normalization="unit"
+    )
+
+    async def embed(self, texts: tuple[str, ...], /) -> EmbeddingResult:
+        return EmbeddingResult(vectors=tuple((1.0, 0.0, 0.0) for _ in texts))
+
+
+def test_restored_memory_vector_search_survives_restart(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        archive = tmp_path / "vector.pcb"
+        target = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'vector.db'}"))
+        model = _ArchiveEmbeddingModel()
+        async with open_builtin_contexts(BuiltinConfig(), embedding_model=model) as source:
+            memory = await (await source.get("project:vector")).artifacts.memory.remember(
+                memory=None,
+                entries=(MemoryEntryInput(kind="fact", text="Archive preserves semantic search."),),
+                mode="append",
+            )
+            assert memory is not None
+            await source.portability.export(["project:vector"], archive)
+        async with open_builtin_contexts(target, embedding_model=model) as restored:
+            assert (await restored.portability.restore(archive)).projections_ready
+            assert (await restored.portability.restore(archive)).inserted == 0
+        async with open_builtin_contexts(target, embedding_model=model) as reopened:
+            service = (await reopened.get("project:vector")).artifacts.memory
+            for mode in ("vector", "hybrid"):
+                result = await service.search("semantic", memories=(memory,), mode=mode)
+                assert result.hits[0].text == "Archive preserves semantic search."
+                assert "vector" in result.hits[0].matched_by
 
     asyncio.run(scenario())

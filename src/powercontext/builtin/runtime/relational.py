@@ -19,13 +19,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from powercontext.artifacts import Artifact
+from powercontext.artifacts import Artifact, ArtifactRef
 from powercontext.builtin.artifacts.experience import (
     EXPERIENCE_INCUBATION_CURSOR_NAME,
     Experience,
@@ -77,7 +78,7 @@ from powercontext.builtin.persistence.memory_index import MemoryIndex, NoMemoryI
 from powercontext.builtin.persistence.sources import SourceRepository, StoredSource
 from powercontext.builtin.persistence.statistics import StatisticsRepository
 from powercontext.builtin.persistence.tables import ARTIFACT_HEADS_TABLE, SOURCE_JOURNAL_HEADS_TABLE
-from powercontext.builtin.portability import PortableBundleService
+from powercontext.builtin.portability import BundleInspection, PortableBundleService
 from powercontext.builtin.review.generation import (
     GeneratedCandidateResult,
     GenerationCapabilityUnavailableError,
@@ -123,6 +124,16 @@ _SOURCE_ADAPTERS: tuple[SourceAdapter[Any, Any, Any], ...] = (
     CONTENT_SOURCE_ADAPTER,
     EXTERNAL_SKILL_SNAPSHOT_SOURCE_ADAPTER,
 )
+_PORTABLE_FAMILIES = (Handoff.family, Memory.family, Experience.family, Skill.family)
+
+
+async def validate_builtin_archive(source: Path) -> BundleInspection:
+    """Check a bundle against built-in adapters without initializing Runtime state."""
+    return await PortableBundleService.validate_archive(
+        source,
+        supported_source_types=tuple(adapter.name for adapter in _SOURCE_ADAPTERS),
+        supported_artifact_families=_PORTABLE_FAMILIES,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,7 +321,7 @@ class RelationalContexts:
             database,
             projection_rebuilder=self.rebuild_portable_projections,
             supported_source_types=tuple(adapter.name for adapter in _SOURCE_ADAPTERS),
-            supported_artifact_families=(Handoff.family, Memory.family, Experience.family, Skill.family),
+            supported_artifact_families=_PORTABLE_FAMILIES,
         )
         self.index = NoMemoryIndex() if index is None else index
         self.experience_index = NoExperienceIndex() if experience_index is None else experience_index
@@ -471,7 +482,26 @@ class RelationalContexts:
         for scope_id in scope_ids:
             services = self._services_for(scope_id)
             _, catalog = services.sources()
-            await services.memory(catalog).rebuild_projections()
+            await services.memory(catalog).rebuild_projections(self._embedding_model)
+            if self.index.capabilities.vector:
+                async with self.database.transaction() as connection:
+                    heads = (
+                        await connection.execute(
+                            select(ARTIFACT_HEADS_TABLE.c.artifact_id, ARTIFACT_HEADS_TABLE.c.revision).where(
+                                ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
+                                ARTIFACT_HEADS_TABLE.c.family == Memory.family,
+                            )
+                        )
+                    ).all()
+                    refs = tuple(
+                        ArtifactRef(family=Memory.family, artifact_id=str(row[0]), revision=int(row[1]))
+                        for row in heads
+                    )
+                    model = self._embedding_model
+                    if refs and (
+                        model is None or not await self.index.vector_complete(connection, scope_id, refs, model.profile)
+                    ):
+                        raise RuntimeError("restored Memory vector projection is incomplete")  # noqa: TRY003
         async with self.database.transaction() as connection:
             await self.experience_index.initialize(connection)
 

@@ -30,6 +30,43 @@ from powercontext.builtin.persistence.tables import (
 from powercontext.builtin.portability import BundleConflictError, BundleFormatError, PortableBundleService
 
 
+@pytest.mark.parametrize("mutation", ["identity_override", "unknown_field", "missing_field", "wrong_type", "scope"])
+def test_restore_rejects_invalid_wire_fields_before_writing(tmp_path: Path, mutation: str) -> None:
+    async def scenario() -> None:
+        archive = tmp_path / "invalid.pcb"
+        async with SQLiteProfile.open(SQLiteConfig(), tables=BUILTIN_TABLES) as source:
+            async with source.database.transaction() as connection:
+                await connection.execute(insert(SOURCE_JOURNAL_HEADS_TABLE).values(scope_id="project:one", position=1))
+            await PortableBundleService(source.database).export(["project:one"], archive)
+        with zipfile.ZipFile(archive) as bundle:
+            manifest = json.loads(bundle.read("manifest.json"))
+            record = json.loads(bundle.read("records.ndjson"))
+        if mutation == "identity_override":
+            record["payload"]["scope_id"] = "project:other"
+        elif mutation == "unknown_field":
+            record["payload"]["unexpected"] = "value"
+        elif mutation == "missing_field":
+            del record["payload"]["position"]
+        elif mutation == "wrong_type":
+            record["payload"]["position"] = True
+        else:
+            manifest["scopes"] = ["project:other"]
+        del record["digest"]
+        canonical = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        record["digest"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+        manifest["total_digest"] = "sha256:" + hashlib.sha256(record["digest"].encode()).hexdigest()
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("manifest.json", json.dumps(manifest))
+            bundle.writestr("records.ndjson", json.dumps(record) + "\n")
+        async with SQLiteProfile.open(SQLiteConfig(), tables=BUILTIN_TABLES) as target:
+            with pytest.raises(BundleFormatError):
+                await PortableBundleService(target.database).restore(archive)
+            async with target.database.transaction() as connection:
+                assert (await connection.execute(select(SOURCE_JOURNAL_HEADS_TABLE))).all() == []
+
+    asyncio.run(scenario())
+
+
 def test_bundle_round_trips_authoritative_scope_data_and_excludes_projections(tmp_path: Path) -> None:
     async def scenario() -> None:
         archive = tmp_path / "scope.pcb"
@@ -284,7 +321,9 @@ def test_restore_keeps_large_bundle_payloads_out_of_process_memory(tmp_path: Pat
             SQLiteConfig(url=f"sqlite+aiosqlite:///{source_path}"), tables=BUILTIN_TABLES
         ) as source:
             async with source.database.transaction() as connection:
-                await connection.execute(insert(SOURCE_JOURNAL_HEADS_TABLE).values(scope_id="project:one", position=1_500))
+                await connection.execute(
+                    insert(SOURCE_JOURNAL_HEADS_TABLE).values(scope_id="project:one", position=1_500)
+                )
                 await connection.execute(
                     insert(SOURCES_TABLE),
                     [

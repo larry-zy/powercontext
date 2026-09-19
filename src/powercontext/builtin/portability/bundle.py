@@ -14,6 +14,7 @@ import base64
 import hashlib
 import json
 import re
+import shutil
 import sqlite3
 import tempfile
 import zipfile
@@ -27,7 +28,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.builtin.persistence.database import AsyncDatabase
@@ -43,6 +44,7 @@ from powercontext.builtin.persistence.tables import (
     SOURCE_JOURNAL_HEADS_TABLE,
     SOURCES_TABLE,
 )
+from powercontext.builtin.portability.schema import BINARY_FIELDS, INTEGER_FIELDS, NULLABLE_FIELDS, RECORD_FIELDS
 
 FORMAT_VERSION = 1
 _RECORDS_NAME = "records.ndjson"
@@ -204,7 +206,8 @@ class PortableBundleService:
             records_path.unlink(missing_ok=True)
             archive_path.unlink(missing_ok=True)
 
-    async def inspect(self, source: Path, /) -> BundleInspection:
+    @staticmethod
+    async def inspect(source: Path, /) -> BundleInspection:
         """Verify structure and checksums without touching the target database."""
 
         return _parse_bundle(source).inspection
@@ -214,9 +217,26 @@ class PortableBundleService:
     ) -> BundleInspection:
         """Verify bundle integrity, dependencies, and optional adapter support."""
 
+        return await self.validate_archive(
+            source,
+            supported_source_types=(
+                self._supported_source_types if supported_source_types is None else supported_source_types
+            ),
+            supported_artifact_families=self._supported_artifact_families,
+        )
+
+    @staticmethod
+    async def validate_archive(
+        source: Path,
+        /,
+        *,
+        supported_source_types: Iterable[str] | None = None,
+        supported_artifact_families: Iterable[str] | None = None,
+    ) -> BundleInspection:
+        """Validate a wire bundle without opening or initializing any database."""
         parsed = _parse_bundle(source)
         _validate_dependencies(source)
-        configured = self._supported_source_types if supported_source_types is None else set(supported_source_types)
+        configured = supported_source_types
         if configured is not None:
             supported = set(configured)
             missing = sorted(
@@ -229,9 +249,9 @@ class PortableBundleService:
             )
             if missing:
                 raise BundleFormatError(f"target does not support source types: {', '.join(missing)}")
-        if self._supported_artifact_families is not None:
+        if supported_artifact_families is not None:
             required_families = _required_artifact_families(_iter_records(source))
-            missing_families = sorted(required_families - self._supported_artifact_families)
+            missing_families = sorted(required_families - set(supported_artifact_families))
             if missing_families:
                 raise BundleFormatError(f"target does not support artifact families: {', '.join(missing_families)}")
         return parsed.inspection
@@ -250,47 +270,64 @@ class PortableBundleService:
         no existing revision or head is overwritten.
         """
 
-        parsed = _parse_bundle(source)
-        await self.validate(source, supported_source_types=supported_source_types)
-        async with self._database.transaction() as connection:
-            inserted, existing = await self._write_records(connection, source)
+        # Own a stable input across validation and replay, even if the caller
+        # replaces the original archive while a restore is running.
+        with tempfile.TemporaryDirectory(prefix="powercontext-restore-") as directory:
+            snapshot = Path(directory) / "bundle.pcb"
+            try:
+                shutil.copyfile(source, snapshot)
+            except OSError as error:
+                raise BundleFormatError("cannot read portable bundle") from error
+            inspection = await self.validate(snapshot, supported_source_types=supported_source_types)
+            with _staged_records(snapshot) as staged:
+                async with self._database.transaction() as connection:
+                    inserted, existing = await self._write_records(connection, staged)
         projections_ready = False
         if self._projection_rebuilder is not None:
-            await self._projection_rebuilder(parsed.inspection.scopes)
+            await self._projection_rebuilder(inspection.scopes)
             projections_ready = True
         return BundleReceipt(
-            bundle_id=parsed.inspection.bundle_id,
-            record_count=parsed.inspection.record_count,
-            total_digest=parsed.inspection.total_digest,
+            bundle_id=inspection.bundle_id,
+            record_count=inspection.record_count,
+            total_digest=inspection.total_digest,
             inserted=inserted,
             already_present=existing,
             projections_ready=projections_ready,
         )
 
-    async def _write_records(self, connection: AsyncConnection, source: Path, /) -> tuple[int, int]:
+    async def _write_records(self, connection: AsyncConnection, staged: sqlite3.Connection, /) -> tuple[int, int]:
         """Replay records in dependency order inside the caller transaction."""
         inserted = 0
         existing = 0
-        # A portable bundle may be produced by another implementation, so do
-        # not trust its physical order.  Re-scan once per dependency level
-        # instead of materializing its records merely to sort them.
         for record_type in _EXPORT_ORDER:
-            for record in _iter_records(source):
-                if record.record_type != record_type:
-                    continue
-                table = _TABLES[record.record_type]
-                where = [table.c[key] == value for key, value in record.identity.items()]
-                row = (await connection.execute(select(table).where(*where))).mappings().one_or_none()
-                if row is not None:
-                    present = _record_from_row(record.record_type, cast(Mapping[str, Any], dict(row)))
-                    if present.digest != record.digest:
-                        raise BundleConflictError(
-                            f"immutable identity conflict: {record.record_type} {dict(record.identity)!r}"
-                        )
-                    existing += 1
-                    continue
-                await connection.execute(insert(table).values(**_row_values(record)))
-                inserted += 1
+            cursor = staged.execute("SELECT document FROM records WHERE kind = ? ORDER BY sequence", (record_type,))
+            while documents := cursor.fetchmany(100):
+                records = tuple(_parse_record(json.loads(row[0])) for row in documents)
+                table = _TABLES[record_type]
+                keys = RECORD_FIELDS[record_type][0]
+                identities = [tuple(record.identity[key] for key in keys) for record in records]
+                rows = (
+                    await connection.execute(
+                        select(table).where(tuple_(*(table.c[key] for key in keys)).in_(identities))
+                    )
+                ).mappings()
+                present = {
+                    _identity_key(record.identity): record.digest
+                    for row in rows
+                    for record in (_record_from_row(record_type, cast(Mapping[str, Any], dict(row))),)
+                }
+                values = []
+                for record in records:
+                    digest = present.get(_identity_key(record.identity))
+                    if digest is not None:
+                        if digest != record.digest:
+                            raise BundleConflictError(f"immutable identity conflict: {record_type}")
+                        existing += 1
+                    else:
+                        values.append(_row_values(record))
+                if values:
+                    await connection.execute(insert(table), values)
+                    inserted += len(values)
         return inserted, existing
 
     async def _stream_export(
@@ -315,14 +352,28 @@ class PortableBundleService:
         return count, records_by_type, digest.value()
 
 
+@contextmanager
+def _staged_records(source: Path) -> Iterator[sqlite3.Connection]:
+    """Index validated records on disk before acquiring the target write transaction."""
+    with tempfile.TemporaryDirectory(prefix="powercontext-records-") as directory:
+        connection = sqlite3.connect(Path(directory) / "records.db")
+        try:
+            connection.execute("CREATE TABLE records (sequence INTEGER PRIMARY KEY, kind TEXT, document BLOB)")
+            connection.executemany(
+                "INSERT INTO records(kind, document) VALUES (?, ?)",
+                ((record.record_type, _canonical_json(_record_document(record))) for record in _iter_records(source)),
+            )
+            connection.execute("CREATE INDEX records_kind ON records(kind, sequence)")
+            connection.commit()
+            yield connection
+        finally:
+            connection.close()
+
+
 def _record_from_row(record_type: RecordType, row: Mapping[str, Any]) -> _Record:
-    table = _TABLES[record_type]
-    identity = {column.name: _json_value(row[column.name]) for column in table.primary_key.columns}
-    payload = {
-        column.name: _json_value(row[column.name])
-        for column in table.columns
-        if column.name not in identity and column.name not in {"searchable_text"}
-    }
+    identity_fields, payload_fields = RECORD_FIELDS[record_type]
+    identity = {name: _json_value(row[name]) for name in identity_fields}
+    payload = {name: _json_value(row[name]) for name in payload_fields}
     canonical = {"record_type": record_type, "schema_version": 1, "identity": identity, "payload": payload}
     return _Record(record_type=record_type, identity=identity, payload=payload, digest=_digest(canonical))
 
@@ -361,6 +412,8 @@ def _parse_bundle(source: Path) -> _ParsedBundle:
     counts: Counter[str] = Counter()
     digest = _DigestAccumulator()
     for record in _iter_records(source):
+        if record.identity["scope_id"] not in manifest["scopes"]:
+            raise BundleFormatError("record scope is not declared in manifest")
         count += 1
         counts[record.record_type] += 1
         digest.add(record.digest)
@@ -389,7 +442,7 @@ def _iter_records(source: Path, /) -> Iterator[_Record]:
     try:
         with zipfile.ZipFile(source) as archive, archive.open(_RECORDS_NAME) as stream:
             count = 0
-            for line in stream:
+            while line := stream.readline(_MAX_LINE_BYTES + 1):
                 if len(line) > _MAX_LINE_BYTES:
                     raise BundleFormatError("record line exceeds size limit")
                 if not line.strip():
@@ -446,13 +499,30 @@ def _parse_record(value: object) -> _Record:
     identity = cast(dict[str, str | int], identity)
     payload = cast(dict[str, Any], payload)
     typed = cast(RecordType, record_type)
-    expected = {column.name for column in _TABLES[typed].primary_key.columns}
-    if set(identity) != expected or not _valid_digest(digest):
+    identity_fields, payload_fields = RECORD_FIELDS[typed]
+    if set(identity) != set(identity_fields) or not _valid_digest(digest):
         raise BundleFormatError("record has invalid identity or digest")
+    if set(payload) != set(payload_fields):
+        raise BundleFormatError("record has invalid payload fields")
+    _validate_field_values(identity, payload)
     canonical = {"record_type": typed, "schema_version": 1, "identity": identity, "payload": payload}
     if _digest(canonical) != digest:
         raise BundleFormatError("record digest does not match content")
     return _Record(record_type=typed, identity=identity, payload=payload, digest=digest)
+
+
+def _validate_field_values(identity: Mapping[str, object], payload: Mapping[str, object]) -> None:
+    for name, field in {**identity, **payload}.items():
+        if field is None and name in NULLABLE_FIELDS and name not in identity:
+            continue
+        if name in BINARY_FIELDS:
+            if not isinstance(_database_value(field), bytes):
+                raise BundleFormatError("record has invalid binary field")
+        elif name in INTEGER_FIELDS:
+            if not isinstance(field, int) or isinstance(field, bool) or field < 0:
+                raise BundleFormatError("record has invalid integer field")
+        elif not isinstance(field, str):
+            raise BundleFormatError("record has invalid text field")
 
 
 def _validate_dependencies(source: Path, /) -> None:

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
-from typing import Annotated, TypeVar
+from typing import Annotated, Any, TypeVar
 
 import typer
 
@@ -19,6 +19,7 @@ from powercontext.builtin.portability import (
     PortableBundleService,
 )
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_runtime
+from powercontext.builtin.runtime.relational import validate_builtin_archive
 from powercontext.paths import default_database_path, default_scheduler_path, sqlite_url
 
 HELP_OPTION_NAMES = ("-h", "--help")
@@ -50,7 +51,7 @@ def inspect_bundle(
 ) -> None:
     """Verify archive structure and checksums without writing domain data."""
 
-    _emit_archive_result(lambda archive: archive.inspect(source))
+    _emit_result(lambda: PortableBundleService.inspect(source))
 
 
 @archive_app.command("restore")
@@ -62,7 +63,7 @@ def restore_bundle(
     """Validate or restore a portable bundle into the configured deployment."""
 
     if dry_run:
-        _emit_archive_result(lambda archive: archive.validate(source))
+        _emit_result(lambda: _validate_only(source))
         return
     if not yes:
         raise typer.BadParameter(  # noqa: TRY003
@@ -83,8 +84,18 @@ async def _run_archive(operation: Callable[[PortableBundleService], Awaitable[_R
 def _emit_archive_result(operation: Callable[[PortableBundleService], Awaitable[_ResultT]], /) -> None:
     """Render expected archive failures without leaking stack traces or records."""
 
+    _emit_result(lambda: _run_archive(operation))
+
+
+async def _validate_only(source: Path) -> BundleInspection:
+    # Validation checks the wire format and built-in adapters, not live Runtime
+    # projections. No database needs to be created or initialized for this.
+    return await validate_builtin_archive(source)
+
+
+def _emit_result(operation: Callable[[], Coroutine[Any, Any, _ResultT]], /) -> None:
     try:
-        _emit(asyncio.run(_run_archive(operation)))
+        _emit(asyncio.run(operation()))
     except BundleFormatError as error:
         typer.echo(f"error: archive validation failed: {error}", err=True)
         raise typer.Exit(code=2) from error
