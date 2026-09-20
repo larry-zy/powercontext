@@ -61,9 +61,9 @@ async def _isolated_database(backend, tmp_path):
 
 @pytest.mark.parametrize("backend", ["seekdb", "oceanbase"])
 @pytest.mark.parametrize("topic_family", [False, True])
-def test_real_legacy_tags_survive_repeated_server_startup(backend, topic_family, tmp_path):
+def test_real_legacy_tags_survive_repeated_server_startup(backend, topic_family, tmp_path, short_tmp_path):
     async def scenario():
-        async with _isolated_database(backend, tmp_path) as (database, open_profile):
+        async with _isolated_database(backend, short_tmp_path) as (database, open_profile):
             settings = ServerSettings(
                 database=database,
                 runtime=RuntimeConfig(artifact_processing_families=()),

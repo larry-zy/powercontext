@@ -531,7 +531,15 @@ class RelationalContexts:
             database,
             projection_rebuilder=self.rebuild_portable_projections,
             supported_source_types=tuple(definition.name for definition in self.source_registry.definitions),
-            supported_artifact_families=(Handoff.family, Memory.family, Experience.family, Skill.family),
+            supported_artifact_families=(
+                Handoff.family,
+                Memory.family,
+                Experience.family,
+                Skill.family,
+                Profile.family,
+                Prompt.family,
+                TopicMemory.family,
+            ),
         )
         self.index = NoMemoryIndex() if index is None else index
         self.topic_memory_index = NoTopicMemoryIndex() if topic_memory_index is None else topic_memory_index
@@ -593,6 +601,7 @@ class RelationalContexts:
             max_concurrency=topic_memory_write_concurrency,
             usage_reporter=self.model_usage_reporter,
         )
+        self._topic_memory_writer = topic_memory_writer
         family_writers = FamilyManagementWriterRegistry((
             topic_memory_writer,
             PromptManagementWriter(self.repositories.artifacts, self.prompt_registry),
@@ -1325,25 +1334,53 @@ class RelationalContexts:
             services = self._services_for(scope_id)
             _, catalog = services.sources()
             await services.memory(catalog).rebuild_projections(self._embedding_model)
-            if self.index.capabilities.vector:
-                async with self.database.transaction() as connection:
-                    heads = (
+            async with self.database.transaction() as connection:
+                memory_refs = tuple(
+                    ArtifactRef(family=Memory.family, artifact_id=str(artifact_id), revision=int(revision))
+                    for artifact_id, revision in (
                         await connection.execute(
-                            select(ARTIFACT_HEADS_TABLE.c.artifact_id, ARTIFACT_HEADS_TABLE.c.revision).where(
+                            select(ARTIFACT_HEADS_TABLE.c.artifact_id, ARTIFACT_HEADS_TABLE.c.revision)
+                            .where(
                                 ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
                                 ARTIFACT_HEADS_TABLE.c.family == Memory.family,
                             )
+                            .order_by(ARTIFACT_HEADS_TABLE.c.artifact_id)
                         )
                     ).all()
-                    refs = tuple(
-                        ArtifactRef(family=Memory.family, artifact_id=str(row[0]), revision=int(row[1]))
-                        for row in heads
-                    )
+                )
+                if self.index.capabilities.vector and memory_refs:
                     model = self._embedding_model
-                    if refs and (
-                        model is None or not await self.index.vector_complete(connection, scope_id, refs, model.profile)
+                    if model is None or not await self.index.vector_complete(
+                        connection, scope_id, memory_refs, model.profile
                     ):
                         raise RuntimeError("restored Memory vector projection is incomplete")  # noqa: TRY003
+                topic_heads = tuple(
+                    (
+                        await connection.execute(
+                            select(ARTIFACT_HEADS_TABLE.c.artifact_id, ARTIFACT_HEADS_TABLE.c.revision)
+                            .where(
+                                ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
+                                ARTIFACT_HEADS_TABLE.c.family == TopicMemory.family,
+                            )
+                            .order_by(ARTIFACT_HEADS_TABLE.c.artifact_id)
+                        )
+                    ).all()
+                )
+            for artifact_id, revision in topic_heads:
+                ref = ArtifactRef(
+                    family=TopicMemory.family,
+                    artifact_id=str(artifact_id),
+                    revision=int(revision),
+                )
+                async with self.database.transaction() as connection:
+                    topic = await self.repositories.artifacts.get(connection, scope_id, ref)
+                if not isinstance(topic, TopicMemory):
+                    raise TypeError("restored Topic Memory decoded to the wrong Artifact type")  # noqa: TRY003
+                projection = await self._topic_memory_writer.prepare(topic.content, usage_scope_id=scope_id)
+                async with self.database.transaction() as connection:
+                    await self.repositories.topic_memories.rebuild_current(connection, scope_id, topic, projection)
+        async with self.database.transaction() as connection:
+            await self.topic_memory_index.validate_current(connection)
         async with self.database.transaction() as connection:
             await self.experience_index.initialize(connection)
 

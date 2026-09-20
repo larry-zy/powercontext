@@ -9,8 +9,9 @@ A portable archive is a `.pcb` file for moving or recovering complete PowerConte
 it preserves domain identities and immutable history rather than copying a SQLite file. Use it for a controlled local
 backup, an offline transfer, or a future backend migration.
 
-This command is a local operator command. It opens the default SQLite database in the PowerContext user-data directory;
-it does not call a remote Server API. Run it only on a machine whose local PowerContext data you control.
+This is an offline operator command. It does not call a remote Server API. Without `--env-file` it opens the default
+SQLite database; with `--env-file` it uses the same SQLite, SeekDB, or OceanBase settings as that deployment. Stop
+PowerContext writers before restore. Export uses one database transaction as its consistent logical snapshot.
 
 ## Prerequisites
 
@@ -39,6 +40,11 @@ powercontext archive export \
 powercontext archive inspect ./backups/payments.pcb
 ```
 
+Add `--no-compress` when the surrounding storage system already compresses objects. Export authorization occurs before
+the first database query. For this offline command, authority is the operating-system and database permission needed to
+read the configured deployment; it never reuses or exports Server bearer tokens. Progress is emitted as content-free
+JSON on stderr while the final receipt remains JSON on stdout.
+
 `export` writes JSON containing the bundle ID, record count, and checksum. `inspect` verifies the ZIP structure,
 per-record digests, total digest, record counts, and selected scopes without opening the target database. Keep the
 reported checksum with the backup inventory if an external backup system needs an independent verification record.
@@ -53,7 +59,10 @@ powercontext archive restore ./backups/payments.pcb --dry-run
 
 Dry-run performs no domain writes. It verifies checksums, required source and Artifact dependencies, and whether the
 configured Runtime can restore the archive's source types and Artifact families. A validation failure exits with code
-`2` and reports only a content-free reason; record bodies are not printed.
+`2` for an invalid bundle, or `3` for unsupported requirements or target conflicts, and reports only a content-free
+reason; record bodies are not printed. A successful report includes
+`already_present`, `conflicts`, required and unsupported Source types and Artifact families, and whether the target has
+a projection rebuilder. Run against a different deployment with `--env-file ./target.env`.
 
 To perform the write, repeat the command with explicit confirmation:
 
@@ -62,8 +71,8 @@ powercontext archive restore ./backups/payments.pcb --yes
 ```
 
 The result is JSON with `inserted`, `already_present`, and `projections_ready`. Treat the restore as ready for search
-only when `projections_ready` is `true`. The Runtime rebuilds portable Memory and Experience search projections after
-the authoritative rows have been restored.
+only when `projections_ready` is `true`. The Runtime rebuilds Memory, Topic Memory, and Experience search projections
+after the authoritative rows have been restored, including configured Memory and Topic Memory vectors.
 
 ## What the bundle preserves
 
@@ -71,10 +80,14 @@ Format version 1 carries the portable relational representation of these support
 
 | Preserved | Not portable |
 | --- | --- |
+| Scope identity, hierarchy, context/external references, and creation identity | Scope access bindings and host-local default selection |
 | Source journal heads and Source records | Search projections and indexes |
-| Artifact Revisions, lineage, and heads | Source cursors and scheduler state |
+| Artifact Revisions, lineage, cross-Scope publication provenance, and heads | Source cursors and scheduler state |
 | Memory entry versions and heads | External Skill registrations and host-local installation state |
-| Candidate versions, decision heads, and their evidence references | Usage statistics, credentials, bearer tokens, and provider secrets |
+| Candidate versions, decision heads, and their evidence references | Audit events, usage facts, evaluation receipts, and restore receipts |
+| Managed Skill package bytes and manifests; Artifact and Memory-entry tags | Download locations and host-local Skill paths |
+| Profile policies, Prompt revisions, and Topic Memory publication metadata | Target-specific embedding configuration |
+| Work contracts, task outcomes, Handoff boundaries and receipts stored as Sources | Credentials, bearer tokens, provider secrets, and host-local Skill installation state |
 
 The archive has a versioned manifest (`format_version`, producer version, scopes, counts, exclusions, and total
 checksum) plus NDJSON records. It is the authoritative round-trip format. CSV may be produced separately for bounded
@@ -91,10 +104,53 @@ If the command is interrupted before completion, do not claim recovery succeeded
 transactionally applied, so a failed write does not leave a successful-looking partial restore. Re-run the same archive
 against the same destination after the previous command has stopped.
 
+The target database stores a durable receipt keyed by `bundle_id`. `authoritative_restored` means the logical rows
+committed but search rebuild has not completed; `ready` means projection rebuild completed. If projection rebuild
+fails, re-run the same restore: identical rows are skipped and the receipt advances to `ready` only after verification.
+The restore command can reopen unfinished Topic Memory projections when a pending restore receipt exists. Normal
+Server startup still rejects incomplete projections; finish the restore before serving requests. Use the same target
+embedding configuration when retrying.
+
+Restore stages records in a temporary disk index before starting the target write transaction. Reserve temporary
+disk space for both the archive copy and its expanded records. Existing MySQL-mode deployments may require an
+explicit Runtime startup schema upgrade from `DATETIME` to `DATETIME(6)` for portable timestamps; back up the database
+and provide schema-alter permissions before that upgrade.
+
+## SQLite to OceanBase migration
+
+Create separate environment files without placing credentials in the bundle:
+
+```bash
+powercontext archive export --env-file ./sqlite.env \
+  --scope-id project:payments --output ./payments.pcb
+powercontext archive restore ./payments.pcb --env-file ./oceanbase.env --dry-run
+powercontext archive restore ./payments.pcb --env-file ./oceanbase.env --yes
+```
+
+The environment files use `POWERCONTEXT_SERVER_DATABASE_KIND` and `POWERCONTEXT_SERVER_DATABASE_URL` as documented in
+the Server configuration guide. Dry-run must report no unsupported families and zero conflicts before the write.
+
+## Format compatibility
+
+Format version `1` readers accept version `1` bundles from any PowerContext producer version. The producer version is
+reported for diagnostics but does not replace the archive schema version. Writers produce only version `1`; there is no
+format `0` downgrade. A reader rejects unknown archive or record schema versions before target writes. Keep the old
+binary available until a restore drill succeeds when upgrading across a PowerContext major release.
+
+## Deployment-native backups
+
+Logical export is not a substitute for a crash-consistent deployment backup:
+
+- SQLite: stop all PowerContext writers before copying the database, or use the SQLite online backup API, for example
+  `sqlite3 powercontext.db ".backup './backups/powercontext.db'"`. Verify the copy with
+  `sqlite3 ./backups/powercontext.db "PRAGMA integrity_check"`, protect it like the source database, and test reopening it.
+- OceanBase: enable tenant data backup and log archiving according to the deployed OceanBase version, retain the backup
+  destination and encryption material independently, and perform a restore drill into an isolated tenant. Use native
+  backup for point-in-time recovery and the portable bundle for logical cross-backend migration.
+
 ## Current boundaries
 
 Export streams database rows to a temporary NDJSON file. Validation stores only record identities in a temporary
 on-disk index, and restore replays dependency levels as streams, so aggregate archive payloads are not retained in
-process memory. The local CLI always opens the default SQLite database under `POWERCONTEXT_HOME` (or the operating
-system user-data directory); it is not a remote Server API and does not use Server authentication or non-SQLite
-database settings. For a live production database, use the database provider's coordinated backup procedures.
+process memory. Scope metadata is bounded by the manifest scope list. The command is not a remote Server API and never
+puts deployment configuration or database credentials into the archive.

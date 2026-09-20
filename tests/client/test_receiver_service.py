@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr
@@ -24,6 +25,11 @@ from powercontext.client.receiver_service import (
     uninstall_systemd_user_service,
 )
 from powercontext.client.skill_receiver import RemoteSkillReceiverConfig
+
+
+@pytest.fixture(autouse=True)
+def linux_service_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service_module, "sys", SimpleNamespace(platform="linux", argv=service_module.sys.argv))
 
 
 def _config(tmp_path: Path) -> RemoteSkillReceiverConfig:
