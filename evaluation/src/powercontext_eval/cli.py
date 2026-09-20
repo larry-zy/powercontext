@@ -32,8 +32,11 @@ from urllib.request import Request, urlopen
 import typer
 from pydantic import ValidationError
 
+from powercontext_eval.benchmarks.longmemeval_v2.catalog import LongMemEvalV2CatalogError
+from powercontext_eval.benchmarks.longmemeval_v2.smoke import prepare_smoke_run
 from powercontext_eval.benchmarks.swebench_pro.catalog import PUBLIC_V2_TASK_SET, SweBenchProCatalog, TaskSet
 from powercontext_eval.codex import DEFAULT_CODEX_MODEL, DEFAULT_REASONING_EFFORT
+from powercontext_eval.models import TreatmentMode
 from powercontext_eval.powercontext_sut import DEFAULT_DOCKER_NETWORK_POOL, run_codex_contract_smoke
 from powercontext_eval.runner import RunConfig, run_swebench_pro_instance
 from powercontext_eval.web.batches import BatchCreate
@@ -43,7 +46,9 @@ if TYPE_CHECKING:
 
 app = typer.Typer(no_args_is_help=True, help="PowerContext evaluation runner.")
 swebench_pro_app = typer.Typer(no_args_is_help=True, help="Pinned SWE-bench Pro evaluation.")
+longmemeval_v2_app = typer.Typer(no_args_is_help=True, help="Pinned LongMemEval-V2 evaluation.")
 app.add_typer(swebench_pro_app, name="swebench-pro")
+app.add_typer(longmemeval_v2_app, name="longmemeval-v2")
 
 
 @app.callback()
@@ -168,6 +173,39 @@ def codex_contract_smoke(
     typer.echo(json.dumps(outcome, ensure_ascii=False, sort_keys=True))
 
 
+@longmemeval_v2_app.command("smoke")
+def longmemeval_v2_smoke(
+    data_root: Path = typer.Option(..., "--data-root"),
+    dataset_lock: Path = typer.Option(..., "--dataset-lock"),
+    harness_root: Path = typer.Option(..., "--harness-root"),
+    smoke_manifest: Path = typer.Option(..., "--smoke-manifest"),
+    output_dir: Path = typer.Option(..., "--output-dir"),
+) -> None:
+    """Validate fixed LongMemEval-V2 inputs and write smoke artifacts without calling a model."""
+
+    try:
+        prepared = prepare_smoke_run(
+            data_root=data_root,
+            dataset_lock=dataset_lock,
+            harness_root=harness_root,
+            smoke_manifest=smoke_manifest,
+            output_dir=output_dir,
+        )
+    except LongMemEvalV2CatalogError as error:
+        raise typer.BadParameter(str(error)) from None
+    typer.echo(
+        json.dumps(
+            {
+                "classification": "smoke-subset",
+                "manifest": str(prepared.manifest_path),
+                "subset": str(prepared.subset_path),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
 @swebench_pro_app.command("run")
 def swebench_pro_run(
     root_path: str = typer.Option(..., "--root"),
@@ -258,6 +296,7 @@ def swebench_pro_create_batch(
     powercontext_ref: str = typer.Option("latest", "--powercontext-ref"),
     task_set: str = typer.Option(PUBLIC_V2_TASK_SET, "--task-set"),
     model: str = typer.Option(DEFAULT_CODEX_MODEL, "--model"),
+    treatment_mode: TreatmentMode = typer.Option(TreatmentMode.OFF_ON, "--treatment-mode"),
     usage_pause_percent: int = typer.Option(80, "--usage-pause-percent", min=1, max=100),
     start_paused: bool = typer.Option(False, "--start-paused/--start-running"),
 ) -> None:
@@ -271,7 +310,7 @@ def swebench_pro_create_batch(
             task_set=cast(TaskSet, task_set),
             model=model,
             reasoning_effort=DEFAULT_REASONING_EFFORT,
-            treatment_mode="off_on",
+            treatment_mode=treatment_mode,
             idempotency_key=idempotency_key,
             usage_pause_percent=usage_pause_percent,
             initial_control_intent="pause" if start_paused else "run",

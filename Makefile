@@ -10,8 +10,20 @@ skills-install: ## Install recommended agent skills from skills-lock.json
 	@npx skills experimental_install
 	@echo "Restart Codex to pick up new skills."
 
+.PHONY: notebooks
+notebooks: ## Open the PowerContext feature tutorials and complete team workflow in JupyterLab.
+	@uv run --locked --group notebooks jupyter lab --notebook-dir=examples/jupyter
+
+.PHONY: notebooks-test
+notebooks-test: ## Execute provider-free tutorials in fresh kernels; use ARGS for models, HTTP, and browser.
+	@uv run --locked --group notebooks python examples/jupyter/run.py $(ARGS)
+
 .PHONY: check
-check: ## Run code quality tools.
+check: workflow-actions-check integration-manifest-check ## Run code quality tools.
+
+.PHONY: workflow-actions-check
+workflow-actions-check: ## Verify third-party GitHub Actions use immutable commit pins.
+	@uv run python scripts/check_workflow_actions.py .github/workflows .github/actions
 	@echo "🚀 Checking lock file consistency with 'pyproject.toml'"
 	@uv lock --locked
 	@echo "🚀 Linting code: Running prek"
@@ -41,9 +53,31 @@ real-e2e-test: ## Run opt-in real Codex Experience/Skill tests; REAL_E2E_MODE de
 		--real-codex-timeout="$${REAL_CODEX_TIMEOUT:-600}" \
 		--real-e2e-env-file="$${REAL_E2E_ENV_FILE:-.env}"
 
+.PHONY: topic-memory-r8-acceptance
+topic-memory-r8-acceptance: ## Run bounded R8 hermetic and available real product-chain layers.
+	@uv run python -m tests.e2e.topic_memory_product.harness \
+		--layers="$${POWERCONTEXT_R8_LAYERS:-e0,e1,e2,e3,e4}" \
+		--output="$${POWERCONTEXT_R8_OUTPUT:-.artifacts/topic-memory-r8}" \
+		--codex-timeout="$${POWERCONTEXT_R8_CODEX_TIMEOUT:-180}" \
+		--generation-timeout="$${POWERCONTEXT_R8_GENERATION_TIMEOUT:-240}"
+
 .PHONY: harness-sync
 harness-sync: ## Install the Bub replay harness environment.
 	@uv sync --project e2e/bub --locked
+
+OPENDAL_TEST_RUN = uv run --isolated --no-project --python 3.12 \
+	--with-editable ".[server]" \
+	--with-editable ./integrations/opendal \
+	--with pytest --with ruff --with ty
+
+.PHONY: opendal-test
+opendal-test: ## Validate the standalone OpenDAL Connector against this checkout.
+	@$(OPENDAL_TEST_RUN) ruff check --no-fix integrations/opendal
+	@$(OPENDAL_TEST_RUN) ruff format --check integrations/opendal
+	@$(OPENDAL_TEST_RUN) ty check --python .venv --python-version 3.12 \
+		--extra-search-path integrations/opendal/src integrations/opendal/src
+	@$(OPENDAL_TEST_RUN) python -m pytest integrations/opendal/tests
+	@$(OPENDAL_TEST_RUN) powercontext-connector-opendal --help >/dev/null
 
 .PHONY: harness-check
 harness-check: ## Validate the Bub replay harness and committed scenarios.
@@ -98,12 +132,31 @@ js-api-generate-check: ## Verify generated JS operations are current.
 	@uv run python scripts/generate_js_operations.py --check
 
 .PHONY: js-test
-js-test: ## Run DeepSeek Harness plugin unit tests.
+js-test: ## Install, build, and test the DeepSeek Harness plugin.
+	@pnpm --dir integrations/dsh/plugins/powercontext install --frozen-lockfile --config.auto-install-peers=false
 	@pnpm --dir integrations/dsh/plugins/powercontext test
+	@pnpm --dir integrations/dsh/plugins/powercontext build
+	@git diff --exit-code -- \
+		integrations/dsh/plugins/powercontext/src/operations.generated.ts \
+		integrations/dsh/plugins/powercontext/lib
+	@pnpm --dir integrations/dsh/plugins/powercontext test
+	@pnpm --dir integrations/dsh/plugins/powercontext test:e2e
+
+.PHONY: dsh-runtime-test
+dsh-runtime-test: ## Test the built plugin in the pinned real DSH runtime with a local model fixture.
+	@pnpm --dir integrations/dsh/plugins/powercontext/tests/runtime install --frozen-lockfile
+	@pnpm --dir integrations/dsh/plugins/powercontext test:e2e:runtime
 
 .PHONY: openclaw-plugin-build
 openclaw-plugin-build: ## Build the external OpenClaw memory plugin.
 	@pnpm --dir integrations/openclaw/plugins/memory-powercontext build
+
+.PHONY: openclaw-plugin-test
+openclaw-plugin-test: ## Install, test, type-check, and build with a Node runtime supported by the OpenClaw SDK.
+	@pnpm --dir integrations/openclaw/plugins/memory-powercontext install --frozen-lockfile
+	@pnpm --dir integrations/openclaw/plugins/memory-powercontext test
+	@pnpm --dir integrations/openclaw/plugins/memory-powercontext run typecheck
+	@pnpm --dir integrations/openclaw/plugins/memory-powercontext run build
 
 .PHONY: openclaw-plugin-pack
 openclaw-plugin-pack: ## Build and pack the external OpenClaw memory plugin.
@@ -140,13 +193,35 @@ publish: ## Publish a release to PyPI.
 .PHONY: build-and-publish
 build-and-publish: build publish ## Build and publish.
 
+.PHONY: docs-install
+docs-install: ## Install the website dependencies.
+	@cd website && pnpm install --frozen-lockfile
+
+.PHONY: docs-build
+docs-build: docs-install ## Build the static website, including HTTP and Python API references.
+	@cd website && CI=true pnpm build
+
 .PHONY: docs-test
-docs-test: ## Test if documentation can be built without warnings or errors
-	@uv run zensical build -s
+docs-test: docs-install ## Lint and build the static website.
+	@cd website && CI=true pnpm lint
+	@cd website && CI=true pnpm test
+	@cd website && CI=true pnpm build
+
+.PHONY: integration-manifest-docs
+integration-manifest-docs: ## Generate the checked-in integration capability matrix pages.
+	@uv run python scripts/generate_integration_manifest_docs.py
+
+.PHONY: integration-manifest-docs-check
+integration-manifest-docs-check: ## Verify the integration capability matrix pages are current.
+	@uv run python scripts/generate_integration_manifest_docs.py --check
+
+.PHONY: integration-manifest-check
+integration-manifest-check: integration-manifest-docs-check ## Verify the complete integration capability contract.
+	@uv run python -m pytest tests/test_integration_manifest.py
 
 .PHONY: docs
-docs: ## Build and serve the documentation
-	@uv run zensical serve
+docs: docs-install ## Build and serve the website locally.
+	@cd website && pnpm dev -- $(ARGS)
 
 .PHONY: help
 help:

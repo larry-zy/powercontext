@@ -21,9 +21,16 @@ from contextlib import AbstractContextManager
 from typing import Protocol, TypeVar
 
 from powercontext.builtin.artifacts.handoff import ActivateHandoff, HandoffActivation
-from powercontext.builtin.runtime.models import MemoryFlushResult
+from powercontext.builtin.runtime.models import (
+    CommitConnectorCheckpoint,
+    ConnectorCheckpointState,
+    MemoryFlushResult,
+    SourceReceipt,
+    SubmitSourceObservation,
+)
 from powercontext.builtin.sources import SourceCursor
 from powercontext.context import PowerContext
+from powercontext.sources import ConnectorBinding, SourceDefinitionManifest
 
 SourcesT = TypeVar("SourcesT", covariant=True)
 ArtifactsT = TypeVar("ArtifactsT", covariant=True)
@@ -32,9 +39,11 @@ TraceAttribute = str | bool | int | float
 
 
 class RuntimeSpan(Protocol):
-    """Record bounded attributes for one internal Runtime stage."""
+    """Record bounded attributes and a deferred outcome for one internal Runtime stage."""
 
     def set_attributes(self, attributes: Mapping[str, TraceAttribute], /) -> None: ...
+
+    def set_outcome(self, outcome: str, /) -> None: ...
 
 
 class RuntimeTracing(Protocol):
@@ -47,11 +56,39 @@ class RuntimeTracing(Protocol):
         attributes: Mapping[str, TraceAttribute],
     ) -> AbstractContextManager[RuntimeSpan]: ...
 
+    def background(
+        self,
+        name: str,
+        *,
+        operation: str,
+        attributes: Mapping[str, TraceAttribute],
+    ) -> AbstractContextManager[RuntimeSpan]: ...
+
 
 class PowerContextProvider(Protocol[SourcesT, ArtifactsT, TriggersT]):
     """Resolve an already composed context without transferring lifecycle ownership."""
 
     async def get(self, scope_id: str, /) -> PowerContext[SourcesT, ArtifactsT, TriggersT]: ...
+
+
+class RemoteIngestion(Protocol):
+    """Server-side authority used by independent Connector workers."""
+
+    async def register_source_definition(
+        self,
+        manifest: SourceDefinitionManifest,
+        /,
+    ) -> SourceDefinitionManifest: ...
+
+    async def connector_checkpoint(self, binding: ConnectorBinding, /) -> ConnectorCheckpointState: ...
+
+    async def submit_source_observation(self, request: SubmitSourceObservation, /) -> SourceReceipt: ...
+
+    async def commit_connector_checkpoint(
+        self,
+        request: CommitConnectorCheckpoint,
+        /,
+    ) -> ConnectorCheckpointState: ...
 
 
 class BuiltinTriggers(Protocol):

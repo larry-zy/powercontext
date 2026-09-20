@@ -19,7 +19,7 @@ import json
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import ModuleType
@@ -29,7 +29,7 @@ import pytest
 
 
 @contextmanager
-def _serve(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
+def _serve(handler: type[BaseHTTPRequestHandler]) -> Generator[str, None, None]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -54,13 +54,15 @@ def _run_main(
     hook_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     payload: dict[str, object],
+    *,
+    settings: object | None = None,
 ) -> tuple[str, str]:
     output = io.StringIO()
     errors = io.StringIO()
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     monkeypatch.setattr(sys, "stdout", output)
     monkeypatch.setattr(sys, "stderr", errors)
-    assert hook_module.main() == 0
+    assert hook_module.main(settings=settings) == 0
     return output.getvalue(), errors.getvalue()
 
 
@@ -82,7 +84,7 @@ def test_user_prompt_submit_injects_prepared_context_and_captures_prompt(
     monkeypatch.setattr(
         hook_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "git:github.com/oceanbase/powercontext",
+        lambda _cwd, **_kwargs: "git:github.com/oceanbase/powercontext",
     )
     captured: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -123,7 +125,7 @@ def test_user_prompt_submit_reads_utf8_stdin_on_windows_encodings(
     monkeypatch.setattr(
         hook_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "git:github.com/oceanbase/powercontext",
+        lambda _cwd, **_kwargs: "git:github.com/oceanbase/powercontext",
     )
     monkeypatch.setattr(
         hook_module,
@@ -161,7 +163,7 @@ def test_user_prompt_compatibility_fallback_is_supported(
     monkeypatch.setattr(
         hook_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
     captured: list[str] = []
     monkeypatch.setattr(
@@ -195,7 +197,7 @@ def test_unexpected_recall_failure_does_not_prevent_prompt_capture(
     monkeypatch.setattr(
         hook_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
     captured: list[str] = []
     monkeypatch.setattr(
@@ -230,7 +232,7 @@ def test_capture_failure_does_not_prevent_context_injection(
     monkeypatch.setattr(
         hook_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
     monkeypatch.setattr(
         hook_module,
@@ -238,7 +240,7 @@ def test_capture_failure_does_not_prevent_context_injection(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("capture failed")),
     )
 
-    output, _ = _run_main(
+    output, errors = _run_main(
         hook_module,
         monkeypatch,
         {
@@ -248,7 +250,41 @@ def test_capture_failure_does_not_prevent_context_injection(
         },
     )
 
-    assert json.loads(output)["hookSpecificOutput"]["additionalContext"] == "prepared context"
+    result = json.loads(output)
+    assert result["hookSpecificOutput"]["additionalContext"] == "prepared context"
+    assert json.loads(result["systemMessage"]) == {
+        "component": "powercontext.claude_code.recall",
+        "event": "capture_source",
+        "outcome": "invalid_response",
+    }
+    assert errors == ""
+
+
+def test_host_diagnostic_is_throttled_across_hook_invocations(
+    hook_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hook_module,
+        "_prepare_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(hook_module._ServerUnavailableError()),
+    )
+    monkeypatch.setattr(hook_module, "resolve_scope_id", lambda *_args, **_kwargs: "project:test")
+    monkeypatch.setattr(hook_module, "_capture_prompt", lambda *_args, **_kwargs: {"position": 1})
+
+    payload: dict[str, object] = {
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": "/workspace/project",
+        "prompt": "Recall context",
+    }
+    outputs: list[str] = []
+    for _ in range(2):
+        output, errors = _run_main(hook_module, monkeypatch, payload)
+        assert errors == ""
+        outputs.append(output)
+
+    assert json.loads(outputs[0])["systemMessage"]
+    assert outputs[1] == ""
 
 
 def test_recall_and_capture_share_one_http_deadline(
@@ -269,7 +305,7 @@ def test_recall_and_capture_share_one_http_deadline(
     monkeypatch.setattr(
         hook_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
 
     _run_main(
@@ -303,7 +339,7 @@ def test_prompt_capture_can_be_disabled(
     monkeypatch.setattr(
         hook_module,
         "resolve_scope_id",
-        lambda _cwd, *, configured_scope_id: "project:test",
+        lambda _cwd, **_kwargs: "project:test",
     )
 
     output = io.StringIO()
@@ -324,38 +360,6 @@ def test_prompt_capture_can_be_disabled(
 
     assert hook_module.main(hook_module.ClaudeCodePluginSettings(capture_prompts=False)) == 0
     assert output.getvalue() == ""
-
-
-def test_context_request_uses_prepare_once(hook_module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
-    requests: list[tuple[str, dict[str, object], int | None]] = []
-
-    def post(
-        path: str,
-        payload: dict[str, object],
-        *,
-        settings: object,
-        deadline: float,
-        expected_status: int | None = None,
-    ) -> dict[str, object]:
-        requests.append((path, payload, expected_status))
-        return _prepared(None, status="empty")
-
-    monkeypatch.setattr(hook_module, "_post_json", post)
-
-    hook_module._prepare_context(
-        "query",
-        "project:test",
-        settings=hook_module.ClaudeCodePluginSettings(),
-        deadline=10.0,
-    )
-
-    assert requests == [
-        (
-            "/v1/context/prepare",
-            {"scope_id": "project:test", "query": "query", "max_bytes": 8000},
-            200,
-        )
-    ]
 
 
 def test_capture_prompt_is_idempotent_and_is_not_a_task_outcome(
@@ -434,10 +438,132 @@ def test_http_failures_are_non_blocking_and_content_free(
     diagnostic = json.loads(errors.getvalue())
     assert diagnostic["outcome"] == outcome
     assert diagnostic["http_status"] == status
+    if outcome == "server_unavailable":
+        assert diagnostic["recovery"] == "powercontext doctor"
     assert "secret" not in errors.getvalue()
 
 
-def test_unknown_schema_and_oversized_content_are_not_injected(
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(404, "invalid_request"), (409, "scope_conflict"), (422, "invalid_request")],
+)
+def test_context_prepare_domain_errors_remain_visible(
+    hook_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    code: str,
+) -> None:
+    monkeypatch.setattr(
+        hook_module,
+        "_prepare_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            hook_module._HttpStatusError(status, "/v1/context/prepare", code)
+        ),
+    )
+    errors = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", errors)
+
+    assert (
+        hook_module._recall_context(
+            "query",
+            "project:test",
+            settings=hook_module.ClaudeCodePluginSettings(),
+            deadline=time.monotonic() + 1,
+        )
+        is None
+    )
+    assert json.loads(errors.getvalue()) == {
+        "component": "powercontext.claude_code.recall",
+        "event": "context_prepare",
+        "outcome": "invalid_response",
+        "http_status": status,
+        "error_code": code,
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(404, "source_not_found"), (409, "source_conflict"), (422, "invalid_request")],
+)
+def test_capture_domain_errors_remain_visible_as_automatic_failures(
+    hook_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    code: str,
+) -> None:
+    monkeypatch.setattr(hook_module, "_prepare_context", lambda *_args, **_kwargs: _prepared("prepared context"))
+    monkeypatch.setattr(hook_module, "resolve_scope_id", lambda *_args, **_kwargs: "project:test")
+    monkeypatch.setattr(
+        hook_module,
+        "_capture_prompt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            hook_module._HttpStatusError(status, "/v1/sources/content", code)
+        ),
+    )
+
+    output, errors = _run_main(
+        hook_module,
+        monkeypatch,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": "/workspace/project",
+            "prompt": "Recall despite a domain error",
+        },
+    )
+
+    result = json.loads(output)
+    assert result["hookSpecificOutput"]["additionalContext"] == "prepared context"
+    assert json.loads(result["systemMessage"]) == {
+        "component": "powercontext.claude_code.recall",
+        "event": "capture_source",
+        "outcome": "invalid_response",
+        "http_status": status,
+        "error_code": code,
+    }
+    assert errors == ""
+
+
+def test_flush_domain_error_remains_visible_as_an_automatic_failure(
+    hook_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hook_module, "_prepare_context", lambda *_args, **_kwargs: _prepared("prepared context"))
+    monkeypatch.setattr(hook_module, "resolve_scope_id", lambda *_args, **_kwargs: "project:test")
+    monkeypatch.setattr(hook_module, "_capture_prompt", lambda *_args, **_kwargs: {"position": 1})
+    monkeypatch.setattr(
+        hook_module,
+        "_flush_through",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            hook_module._HttpStatusError(422, "/v1/memory/flush", "invalid_request")
+        ),
+    )
+
+    output, errors = _run_main(
+        hook_module,
+        monkeypatch,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": "/workspace/project",
+            "prompt": "Recall before flushing",
+        },
+        settings=hook_module.ClaudeCodePluginSettings(
+            server_url="http://127.0.0.1:8000",
+            flush_on_capture=True,
+        ),
+    )
+
+    result = json.loads(output)
+    assert json.loads(result["systemMessage"]) == {
+        "component": "powercontext.claude_code.recall",
+        "event": "flush_memory",
+        "outcome": "invalid_response",
+        "http_status": 422,
+        "error_code": "invalid_request",
+    }
+    assert errors == ""
+
+
+def test_unknown_schema_is_not_injected(
     hook_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -456,39 +582,8 @@ def test_unknown_schema_and_oversized_content_are_not_injected(
         )
         is None
     )
-    with pytest.raises(hook_module._InvalidResponseError):
-        hook_module._validate_prepared_context(_prepared("x" * 8_001))
     assert json.loads(errors.getvalue())["outcome"] == "invalid_response"
     assert "secret" not in errors.getvalue()
-
-
-@pytest.mark.parametrize(
-    "response",
-    [
-        {"schema": "powercontext.prepared-context.v1", "status": "ready", "content": "missing byte count"},
-        {"schema": "powercontext.prepared-context.v1", "status": "empty", "content": "not empty", "content_bytes": 9},
-        {"schema": "powercontext.prepared-context.v1", "status": "ready", "content": "bad count", "content_bytes": 1},
-    ],
-)
-def test_malformed_prepared_context_is_not_injected(
-    hook_module: ModuleType,
-    monkeypatch: pytest.MonkeyPatch,
-    response: dict[str, object],
-) -> None:
-    monkeypatch.setattr(hook_module, "_prepare_context", lambda *_args, **_kwargs: response)
-    errors = io.StringIO()
-    monkeypatch.setattr(sys, "stderr", errors)
-
-    assert (
-        hook_module._recall_context(
-            "query",
-            "project:test",
-            settings=hook_module.ClaudeCodePluginSettings(),
-            deadline=time.monotonic() + 1,
-        )
-        is None
-    )
-    assert json.loads(errors.getvalue())["outcome"] == "invalid_response"
 
 
 def test_hook_refuses_redirects(
@@ -533,20 +628,71 @@ def test_hook_refuses_redirects(
     assert target_headers == []
 
 
-def test_hook_rejects_an_oversized_response_body(hook_module: ModuleType) -> None:
-    class OversizedResponse:
-        fp = object()
+def test_http_error_preserves_structured_error_code(hook_module: ModuleType) -> None:
+    class ErrorHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = b'{"error":{"code":"invalid_request","message":"bad request"}}'
+            self.send_response(422)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-        def __init__(self) -> None:
-            self.remaining = hook_module._MAX_RESPONSE_BYTES + 1
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            pass
 
-        def read(self, amount: int = -1) -> bytes:
-            size = min(amount, self.remaining)
-            self.remaining -= size
-            return b"x" * size
+    with _serve(ErrorHandler) as server_url:
+        settings = hook_module.ClaudeCodePluginSettings(server_url=server_url)
+        with pytest.raises(hook_module._HttpStatusError) as caught:
+            hook_module._post_json(
+                "/v1/context/prepare",
+                {},
+                settings=settings,
+                deadline=time.monotonic() + 1,
+                expected_status=200,
+            )
 
-    with pytest.raises(ValueError, match="exceeds the hook limit"):
-        hook_module._read_response(
-            OversizedResponse(),
-            deadline=time.monotonic() + 2,
+    assert caught.value.status == 422
+    assert caught.value.path == "/v1/context/prepare"
+    assert caught.value.code == "invalid_request"
+
+
+def test_hook_aborts_a_slow_error_response_at_the_shared_deadline(
+    hook_module: ModuleType,
+) -> None:
+    class SlowErrorHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = b'{"error":{"code":"invalid_request","message":"slow"}}'
+            self.send_response(422)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            for byte in body:
+                try:
+                    self.wfile.write(bytes((byte,)))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                time.sleep(0.02)
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            pass
+
+    with _serve(SlowErrorHandler) as server_url:
+        started = time.monotonic()
+        settings = hook_module.ClaudeCodePluginSettings(
+            server_url=server_url,
+            request_timeout_seconds=1.0,
+            http_budget_seconds=0.1,
         )
+        with pytest.raises(hook_module._ServerUnavailableError):
+            hook_module._post_json(
+                "/v1/context/prepare",
+                {},
+                settings=settings,
+                deadline=started + 0.1,
+                expected_status=200,
+            )
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5

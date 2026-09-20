@@ -19,7 +19,11 @@ from powercontext.builtin.portability import (
     PortableBundleService,
 )
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_runtime
-from powercontext.builtin.runtime.relational import validate_builtin_archive
+from powercontext.builtin.artifacts.handoff import Handoff
+from powercontext.builtin.artifacts.memory import Memory
+from powercontext.builtin.artifacts.experience import Experience
+from powercontext.builtin.artifacts.skill import Skill
+from powercontext.builtin.sources import BUILTIN_SOURCE_REGISTRY
 from powercontext.paths import default_database_path, default_scheduler_path, sqlite_url
 
 HELP_OPTION_NAMES = ("-h", "--help")
@@ -90,7 +94,11 @@ def _emit_archive_result(operation: Callable[[PortableBundleService], Awaitable[
 async def _validate_only(source: Path) -> BundleInspection:
     # Validation checks the wire format and built-in adapters, not live Runtime
     # projections. No database needs to be created or initialized for this.
-    return await validate_builtin_archive(source)
+    return await PortableBundleService.validate_archive(
+        source,
+        supported_source_types=tuple(definition.name for definition in BUILTIN_SOURCE_REGISTRY.definitions),
+        supported_artifact_families=(Handoff.family, Memory.family, Experience.family, Skill.family),
+    )
 
 
 def _emit_result(operation: Callable[[], Coroutine[Any, Any, _ResultT]], /) -> None:

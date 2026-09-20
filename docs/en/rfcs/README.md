@@ -1,5 +1,4 @@
 ---
-template: records.html
 title: PowerContext RFCs
 ---
 
@@ -8,7 +7,7 @@ title: PowerContext RFCs
 RFCs record substantial design proposals and the decisions made about them.
 
 An RFC describes design intent, not released behavior or implementation progress. Use the current source and
-[API reference](../modules.md) for implemented public contracts and availability.
+[Python API reference](https://powercontext.oceanbase.io/en/modules/) for implemented public contracts and availability.
 
 The "RFC" (request for comments) process provides a consistent path for substantial changes so maintainers and contributors can build consensus before implementation work starts.
 
@@ -43,7 +42,7 @@ Useful preparatory steps include:
 
 ## The RFC process
 
-- Fork the [PowerContext repo](https://github.com/oceanbase/powercontext) and create a branch from `main`.
+- Fork the [PowerContext repo](https://github.com/oceanbase/powercontext) and create a branch from `master`.
 - Copy [`0000_example.md`](0000_example.md) to `0000-my-feature.md`, where `my-feature` is descriptive.
 - Do not assign an RFC number before opening the pull request. The RFC number should match the pull request number.
 - Submit a pull request containing the RFC document under `docs/en/rfcs/` and keep its Chinese translation in sync.

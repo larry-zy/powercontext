@@ -1,6 +1,6 @@
 # PowerContext
 
-**Not only memory**
+Context for work that humans and agents hand off and continue.
 
 [![PyPI version](https://img.shields.io/pypi/v/powercontext)](https://pypi.org/project/powercontext/)
 [![License Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -8,129 +8,143 @@
 
 *[English](README.md) · [中文](README_CN.md) · [日本語](README_JP.md)*
 
-PowerContext is the upgraded version of [PowerMem](https://www.powermem.ai/) and a context runtime for human-agent
-collaboration. It turns shared work into project context that can be understood, handed off, and continued.
+Work rarely ends with whoever starts it. You hand a task to an agent, the agent gets part of the way, and later you or someone else takes over. The reasoning and current state often stay behind in that conversation.
 
-## Quick start
+PowerContext keeps context with the work across conversations. When you return, you can see what happened and continue from the current state. A new agent can do the same.
 
-You need macOS or Linux, Python 3.11 or newer, [`uv`](https://docs.astral.sh/uv/), and at least one supported agent
-host.
+![You and agents hand work off and continue with stored context](docs/assets/readme-workflow.svg)
 
-### 1. Install PowerContext and integrations
+[Website](https://powercontext.oceanbase.io/) · [Installation walkthrough](https://powercontext.oceanbase.io/en/docs/get-started/quickstart/)
 
-```bash
-uv tool install "powercontext[cli,server]==0.0.2"
+PowerContext 1.0.0 includes the guided setup. The commands below install the stable release and connect
+the matching Agent integration.
 
-# Choose one or more integrations.
-powercontext setup codex --source oceanbase/powercontext --ref v0.0.2
-powercontext setup claude-code --source oceanbase/powercontext --ref v0.0.2
-powercontext setup dsh --source oceanbase/powercontext --ref v0.0.2
-powercontext setup hermes --source oceanbase/powercontext --ref v0.0.2
+## Pick up where the work left off
 
-# OpenClaw and OpenCode currently require the matching CLI and integrations from master.
-uv tool install --force "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@master"
-powercontext setup openclaw --source oceanbase/powercontext --ref master
-powercontext setup opencode --source oceanbase/powercontext --ref master
-```
+You see the context the work needs now: confirmed decisions, constraints, progress, evidence, and next steps. You can continue from there or hand the work to another person or agent without rereading the full history.
 
-The first command installs the latest released CLI and local Server in an isolated environment. The release setup
-commands install their integrations from the matching repository tag. Until OpenClaw and OpenCode are included in a
-release, the extra `uv tool install` command keeps the CLI, Server, and integrations on the same `master` revision.
-Run setup again to refresh an existing integration.
+You decide what will matter later and what needs to move with the task. PowerContext stores durable information as Memory and organizes the current objective and state into a Handoff. You can record reusable approaches as Experience or Skill. PowerContext keeps every item within the scope of the work and preserves its sources and earlier revisions.
 
-### 2. Start and verify the local Server
+## Install, configure, and connect your Agent
 
-Keep the Server running in one terminal:
+You need Git, [uv](https://docs.astral.sh/uv/getting-started/installation/), and your Agent's CLI.
+Python 3.11+ is required; uv can provision it. macOS and Linux are supported; Windows support is `experimental`.
+
+Install 1.0.0 and open the interactive configuration wizard in a dedicated directory:
 
 ```bash
-powercontext server run
+uv tool install --force "powercontext[cli,server]==1.0.0"
+mkdir -p powercontext-config
+cd powercontext-config
+powercontext config init --language en --output .env
 ```
 
-In another terminal, verify the service and plugin:
+If Python dependency downloads are slow or fail, follow the [mirror retry instructions](https://powercontext.oceanbase.io/en/docs/get-started/install-and-run/#retry-dependency-downloads-with-a-mirror).
+
+The wizard asks about storage, local or remote access, memory capabilities, Dashboard, model APIs, and Agent
+connections. Choose **Full memory capabilities** to test automatic Memory and Topic Memory; this requires separate
+Generation and Embedding API credentials. An Agent subscription does not provide those Server credentials.
+Choose **Basic memory** to save and retrieve memories explicitly without additional model APIs.
+
+The wizard writes one `.env` environment file and `.env.next-steps.md`.
+If seekdb needs installing, it asks once and installs the dependency in the background. Follow the printed
+connection details and start Server in this terminal:
 
 ```bash
-powercontext doctor
-powercontext doctor codex  # or: claude-code / dsh / hermes / openclaw
+powercontext server run --env-file .env
 ```
 
-By default, the Server listens on `127.0.0.1:8000`, exposes Streamable HTTP MCP at `/mcp`, and persists data in a
-local SQLite database. Explicit Memory operations work without configuring an inference provider.
+Keep Server running. In another terminal, return to `powercontext-config`, load only the client settings,
+and check the connection:
 
-## Core capabilities
+```bash
+set -a
+. ./.env
+set +a
+powercontext ready
+powercontext capabilities
+```
 
-| Capability | Core value |
-| --- | --- |
-| Memory extraction and management | Explicitly record decisions, constraints, outcomes, state, and next steps worth reusing over time; with a generation model configured, Memory can also be extracted from Sources. Revisions and retirements preserve history |
-| Bounded request-time recall | Before an agent handles a request, generate one schema-validated, cited `PreparedContext` based on project scope, relevance, and a byte budget; recall failures do not block the original task |
-| Handoff | Organize the objective, verified progress, blockers, next step, and evidence into an inspectable work package so another session, task, model, or agent host can continue from a clear state |
-| Sources and evidence lineage | Preserve the original sources of knowledge and link Memory and Artifacts with exact citations; capturing a prompt creates only a Source and does not directly turn it into Memory |
-| Experience and Skill governance | A model or caller can only submit a Candidate; an immutable revision is created only after Review, and a Skill must still be exported explicitly—it cannot approve, install, or execute itself |
-| Local and service deployment | Use SQLite directly for local development, choose OceanBase for team deployments, and integrate with existing systems through HTTP/OpenAPI, MCP, authentication, and OpenTelemetry |
+Continue with `.env.next-steps.md` to create and bind the selected Scopes, install the matching plugins, and launch
+a new Agent session. The [complete walkthrough](https://powercontext.oceanbase.io/en/docs/get-started/quickstart/)
+covers Codex and Claude Code, Dashboard login, SSH forwarding, HTTPS prerequisites, and observable acceptance checks.
+For example, the matching Codex installation is:
 
-## Benchmarks
+```bash
+powercontext setup codex --ref powercontext-v1.0.0
+powercontext doctor codex
+```
 
-### [LoCoMo](https://github.com/snap-research/locomo)
+`doctor` verifies integration setup. To verify automatic memory, check that a real prompt becomes a Source,
+produces a Topic, evolves after a related prompt, and can be recalled in a new session using the same Scope.
 
-![LOCOMO benchmark comparison showing PowerContext accuracy, search latency, and answer token usage against PowerMem and a full-context baseline](docs/assets/locomo-benchmark-comparison.svg)
+For a Server on another machine, use HTTPS or follow the
+[remote connection guide](docs/en/docs/operate/connect-remote-server.md). Setup recognizes remote HTTP URLs from
+flags or environment variables and asks for explicit consent; automated setup uses `--allow-insecure-http`.
 
-### [SWE-bench Pro public v2](https://github.com/scaleapi/SWE-bench_Pro-os)
-
-![SWE-bench Pro public v2 comparison showing an increase from 82.35% with PowerContext off to 86.73% with PowerContext on](docs/assets/swe-bench-pro-public-v2-comparison.svg)
-
-The evaluation ran in a Codex environment, with both the PowerContext OFF and ON groups using the `gpt-5.6-sol`
-model.
-
----
-
-## Integrations
-
-PowerContext provides official integrations and installation guides for Codex, Claude Code, DeepSeek Harness, Hermes
-Agent, LangChain, LangGraph, Pi Coding Agent, OpenClaw, OpenCode, and WorkBuddy. These integrations use the same scoped
-data and history-preserving contracts through PowerContext Server; the host integrations do not start or embed the
-Server.
-
-### Official integrations
+Codex is `official`; other hosts and Python Agent frameworks are `community`; Bub is `evaluation` only.
+These tags describe PowerContext integration maintenance and use. See the
+[capability matrix](https://powercontext.oceanbase.io/en/docs/integrations/capabilities/) for supported features and availability.
 
 <table>
 <tr>
-<td align="center" width="120"><a href="docs/en/docs/how-to/configure-codex.md"><img src="https://github.com/openai.png?size=120" alt="Codex" width="48" height="48" /><br /><sub><b>Codex</b></sub></a></td>
-<td align="center" width="120"><a href="docs/en/docs/how-to/configure-claude-code.md"><img src="https://github.com/anthropics.png?size=120" alt="Claude Code" width="48" height="48" /><br /><sub><b>Claude Code</b></sub></a></td>
-<td align="center" width="120"><a href="docs/en/docs/how-to/configure-dsh.md"><img src="https://github.com/deepseek-ai.png?size=120" alt="DeepSeek Harness" width="48" height="48" /><br /><sub><b>DeepSeek Harness</b></sub></a></td>
-<td align="center" width="120"><a href="integrations/hermes/README.md"><img src="https://github.com/NousResearch/hermes-agent/blob/main/website/static/img/logo.png?raw=true&size=120" alt="Hermes Agent" width="48" height="48" /><br /><sub><b>Hermes Agent</b></sub></a></td>
-<td align="center" width="120"><a href="docs/en/docs/how-to/configure-pi.md"><img src="https://github.com/earendil-works.png?size=120" alt="Pi Coding Agent" width="48" height="48" /><br /><sub><b>Pi Coding Agent</b></sub></a></td>
-<td align="center" width="120"><a href="docs/en/docs/how-to/configure-openclaw.md"><img src="https://github.com/openclaw.png?size=120" alt="OpenClaw" width="48" height="48" /><br /><sub><b>OpenClaw</b></sub></a></td>
-<td align="center" width="120"><a href="docs/en/docs/how-to/configure-opencode.md"><img src="https://github.com/anomalyco.png?size=120" alt="OpenCode" width="48" height="48" /><br /><sub><b>OpenCode</b></sub></a></td>
-<td align="center" width="120"><a href="integrations/workbuddy/README.md"><img src="docs/assets/workbuddy.svg" alt="WorkBuddy" width="48" height="48" /><br /><sub><b>WorkBuddy</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/integrations/codex.md"><img src="assets/codex.png" alt="Codex" width="48" height="48" /><br /><sub><b>Codex</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/integrations/claude-code.md"><img src="assets/claude-code.png" alt="Claude Code" width="48" height="48" /><br /><sub><b>Claude Code</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/integrations/dsh.md"><img src="assets/deepseek.png" alt="DeepSeek Harness" width="48" height="48" /><br /><sub><b>DeepSeek Harness</b></sub></a></td>
+<td align="center" width="120"><a href="integrations/hermes/README.md"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/hermes-dark.png"><img src="assets/hermes.png" alt="Hermes Agent" width="48" height="48" /></picture><br /><sub><b>Hermes Agent</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/integrations/pi.md"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/pi-dark.png"><img src="assets/pi.png" alt="Pi Coding Agent" width="48" height="48" /></picture><br /><sub><b>Pi Coding Agent</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/integrations/openclaw.md"><img src="assets/openclaw.png" alt="OpenClaw" width="48" height="48" /><br /><sub><b>OpenClaw</b></sub></a></td>
+</tr>
+<tr>
+<td align="center" width="120"><a href="docs/en/docs/integrations/opencode.md"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/opencode-dark.png"><img src="assets/opencode.png" alt="OpenCode" width="48" height="48" /></picture><br /><sub><b>OpenCode</b></sub></a></td>
+<td align="center" width="120"><a href="integrations/workbuddy/README.md"><img src="https://thesvg.org/icons/workbuddy/default.svg?size=120" alt="WorkBuddy" width="48" height="48" /><br /><sub><b>WorkBuddy</b></sub></a></td>
+<td align="center" width="120"><a href="integrations/bub/README.md"><img src="https://github.com/bubbuild.png?size=120" alt="Bub" width="48" height="48" /><br /><sub><b>Bub</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/integrations/pydantic-ai.md"><img src="https://thesvg.org/icons/pydantic/default.svg?size=120" alt="Pydantic AI" width="48" height="48" /><br /><sub><b>Pydantic AI</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/integrations/langchain.md"><img src="assets/langchain.png" alt="LangChain" width="48" height="48" /><br /><sub><b>LangChain</b></sub></a></td>
+<td align="center" width="120"><a href="docs/en/docs/integrations/langgraph.md"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/langgraph-dark.png"><img src="assets/langgraph.png" alt="LangGraph" width="48" height="48" /></picture><br /><sub><b>LangGraph</b></sub></a></td>
 </tr>
 </table>
 
-Python agent applications can use the [LangChain middleware](docs/en/docs/how-to/configure-langchain.md) or the
-[LangGraph node and tools adapter](docs/en/docs/how-to/configure-langgraph.md).
+Applications can use PowerContext through the async Python client, HTTP API, MCP, or the in-process Core SDK. See the [interface reference](https://powercontext.oceanbase.io/en/docs/develop/interfaces/) to choose an entry point.
 
-## Development
+Explore the [22 Chinese Jupyter tutorials and a complete team workflow](examples/jupyter/README.md) to run Memory, context preparation, Handoff, Experience, Skill, and a real Agent step by step. The first seven tutorials need no model or API key.
 
-Install the locked development environment and hooks:
+## What changes with PowerContext
+
+![Compact comparison of PowerContext results on LoCoMo and SWE-bench Pro](docs/assets/readme-benchmark-summary.svg)
+
+See the [methods, full results, and limitations](https://powercontext.oceanbase.io/en/benchmarks/) behind these comparisons.
+
+## Build PowerContext
 
 ```bash
 make install
-```
-
-Run the main validation commands before opening a pull request:
-
-```bash
 make check
 make test
-make docs-test
 ```
 
-After changing `openapi/powercontext.yaml`, run `make contract-test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
-complete workflow and [`docs/en/development/`](docs/en/development/core-protocol.md) for implementation guides.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete development workflow.
 
-## Community
+## Learn more
 
-Questions and feedback are welcome in [Discord](https://discord.com/invite/74cF8vbNEs). Use
-[GitHub Issues](https://github.com/oceanbase/powercontext/issues) for reproducible defects and focused feature
-requests.
+- [Get started](https://powercontext.oceanbase.io/en/docs/get-started/quickstart/)
+- [Connect Agents](https://powercontext.oceanbase.io/en/docs/integrations/)
+- [Manage context](https://powercontext.oceanbase.io/en/docs/workflows/)
+- [Deploy and operate](https://powercontext.oceanbase.io/en/docs/operate/)
+- [Develop with APIs](https://powercontext.oceanbase.io/en/docs/develop/)
+
+PowerContext is the successor to [PowerMem](https://www.powermem.ai/).
+
+## Contributors
+
+Thank you to everyone who contributes to PowerContext. ❤️
+
+<a href="https://github.com/oceanbase/powercontext/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=oceanbase/powercontext&amp;max=100&amp;columns=12" alt="PowerContext contributors" />
+</a>
+
+[See all contributors](https://github.com/oceanbase/powercontext/graphs/contributors) ·
+[Start contributing](CONTRIBUTING.md)
 
 ## License
 

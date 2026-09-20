@@ -1,11 +1,13 @@
 # DeepSeek Harness integration
 
+`community`
+
 `plugins/powercontext` contains the PowerContext plugin for DeepSeek Harness.
 
 Install the PowerContext tool first, then configure the plugin from the same Git ref:
 
 ```bash
-uv tool install "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@master"
+uv tool install --force "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@master"
 powercontext setup dsh --source oceanbase/powercontext --ref master
 powercontext server run
 ```

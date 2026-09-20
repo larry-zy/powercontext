@@ -1,5 +1,4 @@
 ---
-template: records.html
 title: PowerContext RFC
 ---
 
@@ -8,7 +7,7 @@ title: PowerContext RFC
 RFC 记录重要的设计提案及其决策。
 
 RFC 描述设计意图，不代表已经发布的行为或实现进度。已实现的公开契约及其可用性以当前源码和
-[API 参考](../modules.md)为准。
+[Python API 参考](https://powercontext.oceanbase.io/zh/modules/)为准。
 
 RFC（request for comments）流程为重大变更提供一致路径，使维护者和贡献者可以在实现开始前形成共识。
 
@@ -43,7 +42,7 @@ RFC（request for comments）流程为重大变更提供一致路径，使维护
 
 ## RFC 流程
 
-- Fork [PowerContext repo](https://github.com/oceanbase/powercontext)，并从 `main` 创建分支。
+- Fork [PowerContext repo](https://github.com/oceanbase/powercontext)，并从 `master` 创建分支。
 - 将 [`0000_example.md`](0000_example.md) 复制为 `0000-my-feature.md`，其中 `my-feature` 应具有描述性。
 - 打开 pull request 前不要分配 RFC 编号。RFC 编号应与 pull request 编号一致。
 - 提交包含 RFC 文档的 pull request，文档位于 `docs/en/rfcs/` 下，并同步维护 `docs/zh/rfcs/` 中的中文翻译。

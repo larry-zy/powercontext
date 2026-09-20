@@ -18,7 +18,7 @@
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
 import { describe, expect, it } from "vitest";
 import { resolvePowerContextConfig } from "./config.js";
-import type { PowerContextClient } from "./http.js";
+import { PowerContextRequestError, type PowerContextClient } from "./http.js";
 import {
   createMemoryGetTool,
   createMemoryRetireTool,
@@ -31,6 +31,7 @@ import {
   POWERCONTEXT_MEMORY_SEARCH_TOOL,
   POWERCONTEXT_MEMORY_STORE_TOOL,
 } from "./tools.js";
+import { encodeCitation } from "./types.js";
 
 describe("PowerContext tools", () => {
   it("uses PowerContext-prefixed names for search and read tools", () => {
@@ -41,7 +42,7 @@ describe("PowerContext tools", () => {
     } as OpenClawPluginToolContext;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
     };
 
@@ -59,7 +60,7 @@ describe("PowerContext tools", () => {
     } as OpenClawPluginToolContext;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
     };
 
@@ -83,7 +84,7 @@ describe("PowerContext tools", () => {
     const manager = {} as never;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
       managerFor: () => manager,
     };
@@ -106,7 +107,7 @@ describe("PowerContext tools", () => {
     } as OpenClawPluginToolContext;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
     };
     const tool = createMemorySearchTool(context, deps);
@@ -129,7 +130,7 @@ describe("PowerContext tools", () => {
     } as OpenClawPluginToolContext;
     const deps = {
       client,
-      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "http://powercontext.test" }),
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
       isPrivateSession: () => true,
     };
     const tool = createMemoryGetTool(context, deps);
@@ -137,5 +138,80 @@ describe("PowerContext tools", () => {
     const result = await tool!.execute("call-1", {});
 
     expect(result.details).toMatchObject({ path: "", unavailable: true });
+  });
+
+  it("preserves direct 404, 409, and 422 domain results", async () => {
+    const context = {
+      agentId: "main",
+      sessionKey: "agent:main:telegram:direct:user-1",
+    } as OpenClawPluginToolContext;
+    const citation = encodeCitation({
+      memory_ref: { family: "memory", artifact_id: "artifact-1", revision: 1 },
+      entry_id: "entry-1",
+      entry_version_id: "version-1",
+    });
+    const config = () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" });
+    const domainClient = (status: number) => ({
+      async post() {
+        throw new PowerContextRequestError("/v1/memory/entries/get", "domain error", status);
+      },
+    }) as unknown as PowerContextClient;
+
+    const notFound = await createMemoryGetTool(context, {
+      client: domainClient(404),
+      getConfig: config,
+      isPrivateSession: () => true,
+    })!.execute("call-1", { path: citation });
+    expect(notFound.details).toMatchObject({ path: citation, text: "", status: "not_found", code: "not_found" });
+    expect(notFound.details).not.toHaveProperty("unavailable");
+
+    const conflict = await createMemoryReviseTool(context, {
+      client: domainClient(409),
+      getConfig: config,
+      isPrivateSession: () => true,
+    })!.execute("call-2", { citation, text: "new text", kind: "fact" });
+    expect(conflict.details).toMatchObject({ status: "conflict", code: "conflict" });
+
+    const invalidRequest = await createMemoryStoreTool(context, {
+      client: domainClient(422),
+      getConfig: config,
+      isPrivateSession: () => true,
+    })!.execute("call-3", { text: "fact", kind: "fact" });
+    expect(invalidRequest.details).toMatchObject({ status: "invalid_request", code: "invalid_request" });
+  });
+
+  it("uses the Server-resolved Scope for a memory mutation", async () => {
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const client = {
+      async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
+        requests.push({ path, body });
+        if (path === "/v1/scope-bindings/resolve") {
+          return { scope_id: "scp_resolved" } as T;
+        }
+        return {
+          memory: { family: "memory", artifact_id: "artifact-1", revision: 1 },
+          entry: null,
+        } as T;
+      },
+    } as unknown as PowerContextClient;
+    const context = {
+      agentId: "main",
+      sessionKey: "agent:main:telegram:direct:user-1",
+      activeProjectKeys: ["/workspace/project"],
+    } as OpenClawPluginToolContext;
+    const deps = {
+      client,
+      getConfig: () => resolvePowerContextConfig(undefined, { endpoint: "https://powercontext.test" }),
+      isPrivateSession: () => true,
+    };
+
+    const result = await createMemoryStoreTool(context, deps)!.execute("call-1", { text: "durable fact" });
+
+    expect(result.details).toMatchObject({ status: "stored", revision: 1 });
+    expect(requests.map((request) => request.path)).toEqual([
+      "/v1/scope-bindings/resolve",
+      "/v1/memory/remember",
+    ]);
+    expect(requests[1].body).toMatchObject({ scope_id: "scp_resolved", text: "durable fact" });
   });
 });

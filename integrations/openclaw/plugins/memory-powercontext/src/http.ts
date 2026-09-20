@@ -16,25 +16,25 @@
 
 
 import type { PowerContextConfig } from "./config.js";
+import { normalizeServerUrl } from "./transport.js";
 
 export class PowerContextRequestError extends Error {
   readonly status?: number;
   readonly path: string;
+  readonly code?: string;
 
-  constructor(path: string, message: string, status?: number) {
+  constructor(path: string, message: string, status?: number, code?: string) {
     super(message);
     this.name = "PowerContextRequestError";
     this.path = path;
     this.status = status;
+    this.code = code;
   }
 }
 
 export type PowerContextClient = ReturnType<typeof createPowerContextClient>;
 
-export function createPowerContextClient(
-  getConfig: () => PowerContextConfig,
-  log: (message: string) => void,
-) {
+export function createPowerContextClient(getConfig: () => PowerContextConfig) {
   async function request<T>(
     method: "GET" | "POST",
     path: string,
@@ -45,6 +45,7 @@ export function createPowerContextClient(
     if (!config.endpoint) {
       throw new PowerContextRequestError(path, "PowerContext endpoint is not configured");
     }
+    const endpoint = normalizeServerUrl(config.endpoint, config.allowInsecureHttp);
     const controller = new AbortController();
     const abort = () => controller.abort();
     signal?.addEventListener("abort", abort, { once: true });
@@ -64,8 +65,9 @@ export function createPowerContextClient(
       }
       let response: Response;
       try {
-        response = await fetch(`${config.endpoint}${path}`, {
+        response = await fetch(`${endpoint}${path}`, {
           method,
+          redirect: "manual",
           headers,
           ...(body ? { body: JSON.stringify(body) } : {}),
           signal: controller.signal,
@@ -99,14 +101,17 @@ export function createPowerContextClient(
             : record && "detail" in record && typeof record.detail === "string"
               ? record.detail
               : `HTTP ${response.status}`;
-        throw new PowerContextRequestError(path, detail, response.status);
+        const code =
+          error && "code" in error && typeof error.code === "string"
+            ? error.code
+            : undefined;
+        throw new PowerContextRequestError(path, detail, response.status, code);
       }
       return payload as T;
     } catch (error) {
       if (error instanceof PowerContextRequestError) {
         throw error;
       }
-      log(`PowerContext request failed for ${path}: ${String(error)}`);
       throw new PowerContextRequestError(path, String(error));
     } finally {
       clearTimeout(timer);

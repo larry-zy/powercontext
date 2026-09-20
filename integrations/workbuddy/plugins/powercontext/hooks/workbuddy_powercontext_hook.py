@@ -42,16 +42,18 @@ else:
 
 _HOOKS_ROOT = Path(__file__).resolve().parent
 _PLUGIN_ROOT = _HOOKS_ROOT.parent
+_SCRIPTS_ROOT = _PLUGIN_ROOT / "scripts"
 sys.path.insert(0, str(_PLUGIN_ROOT))
 sys.path.insert(0, str(_HOOKS_ROOT))
+sys.path.insert(0, str(_SCRIPTS_ROOT))
 
 import prepared_context as _prepared_context  # noqa: E402
 from workbuddy_settings import WorkBuddyPluginSettings  # noqa: E402
 
-if (_HOOKS_ROOT / "powercontext_project_scope.py").is_file():
-    from powercontext_project_scope import resolve_scope_id
+if (_HOOKS_ROOT / "powercontext_scope_binding.py").is_file():
+    from powercontext_scope_binding import resolve_scope_id
 else:
-    from scripts.project_scope import resolve_scope_id
+    from workspace_scope import resolve_scope_id
 
 _MAX_CONTEXT_BYTES = _prepared_context.MAX_CONTEXT_BYTES
 _InvalidResponseError = _prepared_context.InvalidPreparedContextResponse
@@ -118,12 +120,17 @@ def main(settings: WorkBuddyPluginSettings | None = None) -> int:
         cwd = payload.get("cwd")
         context = None
         if prompt is not None and prompt.strip() and isinstance(cwd, str):
+            http_deadline = monotonic() + settings.http_budget_seconds
             try:
-                scope_id = resolve_scope_id(cwd, configured_scope_id=settings.scope_id)
+                scope_id = resolve_scope_id(
+                    cwd,
+                    session_id=_payload_identifier(payload, "session_id"),
+                    settings=settings,
+                    deadline=http_deadline,
+                )
             except Exception:
                 scope_id = None
             if scope_id:
-                http_deadline = monotonic() + settings.http_budget_seconds
                 with suppress(Exception):
                     context = _recall_context(
                         prompt,
@@ -194,6 +201,7 @@ def _prepare_context(
             "scope_id": scope_id,
             "query": query,
             "max_bytes": _MAX_CONTEXT_BYTES,
+            **({"assembly": settings.context_assembly} if settings.context_assembly is not None else {}),
         },
         settings=settings,
         deadline=deadline,

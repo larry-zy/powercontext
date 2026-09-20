@@ -15,13 +15,15 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { UnavailableError } from '../src/errors.ts'
+import { PowerContextClient } from '../src/client.ts'
+import { ServerResponseError, UnavailableError } from '../src/errors.ts'
 import { runRecallPreStep, type RecallInput } from '../src/recall.ts'
 import type { ResolvedConfig } from '../src/config.ts'
-import { deriveScopeId } from '../src/scope.ts'
 
 const config: ResolvedConfig = {
+  sources: { baseUrl: 'plugin', authorization: 'default', scopeId: 'plugin' },
   baseUrl: 'http://127.0.0.1:8000',
+  allowInsecureHttp: false,
   authorization: undefined,
   scopeId: 'project:demo',
   timeoutMs: 4000,
@@ -65,10 +67,16 @@ describe('runRecallPreStep fail-open', () => {
       if (operationId === 'prepare_context') throw new UnavailableError('/v1/context/prepare')
       return { kind: 'json', value: { status: 'accepted' }, status: 202, requestId: undefined }
     })
-    const result = await runRecallPreStep(input({ next, client: { request } as never }))
+    const log = vi.fn()
+    const result = await runRecallPreStep(input({ next, client: { request } as never, log }))
     expect(next).toHaveBeenCalledOnce()
     expect(result).toEqual({ kind: 'enter', messages: [{ id: 'user' }] })
     expect(request).toHaveBeenCalled()
+    expect(log).toHaveBeenCalledWith({
+      event: 'context_prepare',
+      outcome: 'server_unavailable',
+      recovery: 'powercontext doctor',
+    })
   })
 
   it('does not throw when next is reached after an invalid prepare payload', async () => {
@@ -234,23 +242,19 @@ describe('runRecallPreStep fail-open', () => {
     }
   })
 
-  it('skips recall when cwd is missing and scopeId is not configured', async () => {
+  it('recalls from the Server default when cwd and scopeId are absent', async () => {
     const next = vi.fn(async () => ({ kind: 'enter' as const, messages: [{ id: 'user' }] }))
     const log = vi.fn()
     const result = await runRecallPreStep(input({
       next,
       cwd: undefined,
       config: { ...config, scopeId: undefined },
-      resolveScope: (cwd) => deriveScopeId(cwd),
+      resolveScope: async () => 'default-scope',
       log,
     }))
     expect(next).toHaveBeenCalledOnce()
     expect(result).toEqual({ kind: 'enter', messages: [{ id: 'user' }] })
-    expect(log).toHaveBeenCalledWith({
-      event: 'context_prepare',
-      outcome: 'skipped',
-      reason: 'missing_session_cwd',
-    })
+    expect(log).toHaveBeenCalled()
   })
 
   it('recalls with configured scopeId and omits a fabricated cwd from Source', async () => {
@@ -273,7 +277,7 @@ describe('runRecallPreStep fail-open', () => {
     await runRecallPreStep(input({
       cwd: undefined,
       client: { request } as never,
-      resolveScope: (cwd) => deriveScopeId(cwd, { configuredScopeId: 'project:demo' }),
+      resolveScope: async () => 'project:demo',
     }))
     const capture = request.mock.calls.find((call) => call[0] === 'capture_content_source')
     expect(capture?.[0]).toBe('capture_content_source')
@@ -283,4 +287,153 @@ describe('runRecallPreStep fail-open', () => {
     })
     expect((capture?.[1] as { metadata: { cwd?: string } }).metadata.cwd).toBeUndefined()
   })
+
+  it('reports a flush domain failure against the real flush endpoint', async () => {
+    const request = vi.fn(async (operationId: string) => {
+      if (operationId === 'prepare_context') {
+        return {
+          kind: 'json' as const,
+          value: {
+            schema: 'powercontext.prepared-context.v1',
+            status: 'empty',
+            content: null,
+            content_bytes: 0,
+          },
+          status: 200,
+          requestId: undefined,
+        }
+      }
+      if (operationId === 'capture_content_source') {
+        return { kind: 'json' as const, value: { status: 'accepted', position: 1 }, status: 202, requestId: undefined }
+      }
+      throw new ServerResponseError({ statusCode: 409, path: '/v1/memory/flush', code: 'conflict' })
+    })
+    const log = vi.fn()
+
+    await runRecallPreStep(input({
+      client: { request } as never,
+      config: { ...config, flushOnCapture: true },
+      log,
+    }))
+
+    expect(log).toHaveBeenCalledWith({
+      event: 'flush_memory',
+      outcome: 'invalid_response',
+      http_status: 409,
+      error_code: 'conflict',
+    })
+    expect(log).toHaveBeenCalledWith({ event: 'capture_content_source', outcome: 'ok', status: 202 })
+  })
+
+  it('reports a prepare domain failure from the actual endpoint', async () => {
+    const fetch = vi.fn(async (url: string) => {
+      expect(url).toBe('http://127.0.0.1:8000/v1/context/prepare')
+      return new Response(JSON.stringify({ error: { code: 'invalid_request' } }), { status: 422 })
+    })
+    const log = vi.fn()
+
+    await runRecallPreStep(input({
+      client: new PowerContextClient({
+        baseUrl: config.baseUrl,
+        requestTimeoutMs: config.requestTimeoutMs,
+        fetch,
+      }),
+      config: { ...config, capturePrompts: false },
+      log,
+    }))
+
+    expect(log).toHaveBeenCalledWith({
+      event: 'context_prepare',
+      outcome: 'invalid_response',
+      http_status: 422,
+      error_code: 'invalid_request',
+    })
+  })
+
+  it('reports a capture domain failure from the actual endpoint', async () => {
+    const fetch = vi.fn(async (url: string) => {
+      if (url === 'http://127.0.0.1:8000/v1/context/prepare') {
+        return new Response(JSON.stringify({
+          schema: 'powercontext.prepared-context.v1',
+          status: 'empty',
+          content: null,
+          content_bytes: 0,
+        }))
+      }
+      expect(url).toBe('http://127.0.0.1:8000/v1/sources/content')
+      return new Response(JSON.stringify({ error: { code: 'invalid_request' } }), { status: 422 })
+    })
+    const log = vi.fn()
+
+    await runRecallPreStep(input({
+      client: new PowerContextClient({
+        baseUrl: config.baseUrl,
+        requestTimeoutMs: config.requestTimeoutMs,
+        fetch,
+      }),
+      log,
+    }))
+
+    expect(log).toHaveBeenCalledWith({
+      event: 'capture_content_source',
+      outcome: 'invalid_response',
+      http_status: 422,
+      error_code: 'invalid_request',
+    })
+  })
+
+  it('reports a flush domain failure from the actual endpoint', async () => {
+    const fetch = vi.fn(async (url: string) => {
+      if (url === 'http://127.0.0.1:8000/v1/context/prepare') {
+        return new Response(JSON.stringify({
+          schema: 'powercontext.prepared-context.v1',
+          status: 'empty',
+          content: null,
+          content_bytes: 0,
+        }))
+      }
+      if (url === 'http://127.0.0.1:8000/v1/sources/content') {
+        return new Response(JSON.stringify({ status: 'accepted', position: 1 }), { status: 202 })
+      }
+      expect(url).toBe('http://127.0.0.1:8000/v1/memory/flush')
+      return new Response(JSON.stringify({ error: { code: 'conflict' } }), { status: 409 })
+    })
+    const log = vi.fn()
+
+    await runRecallPreStep(input({
+      client: new PowerContextClient({
+        baseUrl: config.baseUrl,
+        requestTimeoutMs: config.requestTimeoutMs,
+        fetch,
+      }),
+      config: { ...config, flushOnCapture: true },
+      log,
+    }))
+
+    expect(log).toHaveBeenCalledWith({
+      event: 'flush_memory',
+      outcome: 'invalid_response',
+      http_status: 409,
+      error_code: 'conflict',
+    })
+    expect(log).toHaveBeenCalledWith({ event: 'capture_content_source', outcome: 'ok', status: 202 })
+  })
+})
+
+
+it('forwards explicit assembly and delivers standard text intact', async () => {
+  const content = '\n# PowerContext historical context\n>     原始文本\n'
+  const assembly = { sections: [{ family: 'memory', limit: 3 }], show: ['recall_rank'] }
+  const request = vi.fn(async () => ({
+    kind: 'json' as const, status: 200, requestId: undefined,
+    value: { schema: 'powercontext.prepared-context.v1', status: 'ready', content, content_bytes: Buffer.byteLength(content, 'utf8') },
+  }))
+  const wrapContent = vi.fn((text: string) => ({ role: 'user', content: [{ type: 'text', text }] }))
+  await runRecallPreStep(input({
+    client: { request } as never,
+    config: { ...config, contextAssembly: assembly, capturePrompts: false },
+    wrapContent,
+  }))
+  expect(request).toHaveBeenCalledWith('prepare_context', expect.objectContaining({ assembly }), undefined)
+  expect(wrapContent.mock.calls[0][0].endsWith(content)).toBe(true)
 })

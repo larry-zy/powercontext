@@ -17,9 +17,10 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { describe, expect, it } from "vitest";
-import { resolvePowerContextConfig, resolvePowerContextScope } from "./config.js";
-import type { PowerContextClient } from "./http.js";
+import { resolvePowerContextConfig } from "./config.js";
+import { PowerContextRequestError, type PowerContextClient } from "./http.js";
 import { registerPowerContextLifecycle } from "./lifecycle.js";
+import { scopeBindingKeys, type ScopeBindingKey } from "./scope.js";
 
 type Hook = (event: unknown, context: unknown) => unknown;
 
@@ -30,11 +31,27 @@ function createLifecycleHarness() {
   const flushScopes: string[] = [];
   const capturedScopes: string[] = [];
   const contextQueries: string[] = [];
+  const scopeResolutionRequests: Array<Record<string, unknown>> = [];
   let memoryExtraction = true;
+  let contextPrepareError: unknown;
+  let preparedResponse: unknown;
+  const prepareRequests: Array<Record<string, unknown>> = [];
+  let captureError: unknown;
+  let flushError: unknown;
   const config = resolvePowerContextConfig(undefined, {
-    endpoint: "http://powercontext.test",
-    scopeMode: "project",
+    endpoint: "https://powercontext.test",
   });
+  const projectScopes = new Map(
+    [
+      ["/workspace/project-a", "scp_project_a"],
+      ["/workspace/project-b", "scp_project_b"],
+    ].map(([projectKey, scopeId]) => {
+      const binding = scopeBindingKeys({ agentId: "main", activeProjectKeys: [projectKey] }).find(
+        (key) => key.kind === "project",
+      );
+      return [binding!.external_id, scopeId] as const;
+    }),
+  );
   const client = {
     async get<T>(path: string): Promise<T> {
       if (path !== "/v1/capabilities") {
@@ -43,14 +60,35 @@ function createLifecycleHarness() {
       return { memory_extraction: memoryExtraction } as T;
     },
     async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
+      if (path === "/v1/scope-bindings/resolve") {
+        scopeResolutionRequests.push(body);
+        const bindingKeys = body.binding_keys as ScopeBindingKey[];
+        const projectBinding = bindingKeys.find(
+          (key) => key.kind === "project" && projectScopes.has(key.external_id),
+        );
+        return {
+          scope_id: projectBinding ? projectScopes.get(projectBinding.external_id) : "scp_default",
+        } as T;
+      }
       if (path === "/v1/memory/flush") {
         flushScopes.push(String(body.scope_id));
+        if (flushError !== undefined) {
+          throw flushError;
+        }
       }
       if (path === "/v1/sources/content") {
         capturedScopes.push(String(body.scope_id));
+        if (captureError !== undefined) {
+          throw captureError;
+        }
       }
       if (path === "/v1/context/prepare") {
         contextQueries.push(String(body.query));
+        prepareRequests.push(body);
+        if (preparedResponse !== undefined) return preparedResponse as T;
+        if (contextPrepareError) {
+          throw contextPrepareError;
+        }
       }
       return {
         schema: "powercontext.prepared-context.v1",
@@ -82,12 +120,24 @@ function createLifecycleHarness() {
     capturedScopes,
     config,
     contextQueries,
+    prepareRequests,
+    setPreparedResponse(value: unknown) { preparedResponse = value; },
     debugMessages,
     flushScopes,
     hooks,
     setMemoryExtraction(value: boolean) {
       memoryExtraction = value;
     },
+    setContextPrepareError(error: unknown) {
+      contextPrepareError = error;
+    },
+    setCaptureError(error: unknown) {
+      captureError = error;
+    },
+    setFlushError(error: unknown) {
+      flushError = error;
+    },
+    scopeResolutionRequests,
     warnings,
   };
 }
@@ -118,11 +168,124 @@ describe("PowerContext lifecycle", () => {
       sessionContext,
     );
 
-    expect(harness.flushScopes).toEqual([
-      resolvePowerContextScope("main", harness.config, ["/workspace/project-a"]),
-      resolvePowerContextScope("main", harness.config, ["/workspace/project-b"]),
-    ]);
+    expect(harness.flushScopes).toEqual(["scp_project_a", "scp_project_b"]);
     expect(harness.warnings).toEqual([]);
+  });
+
+  it("surfaces a bounded, content-free unavailable diagnostic", async () => {
+    const harness = createLifecycleHarness();
+    harness.setContextPrepareError(
+      new PowerContextRequestError("/v1/context/prepare", "do not expose this detail"),
+    );
+    const beforePromptBuild = harness.hooks.get("before_prompt_build");
+    const context = {
+      agentId: "main",
+      sessionId: "session-diagnostic",
+      sessionKey: "agent:main:telegram:direct:user-1",
+    };
+
+    await beforePromptBuild!(
+      { messages: [{ role: "user", content: "first request" }], prompt: "" },
+      context,
+    );
+    await beforePromptBuild!(
+      { messages: [{ role: "user", content: "second request" }], prompt: "" },
+      context,
+    );
+
+    expect(harness.warnings).toHaveLength(1);
+    expect(harness.warnings[0]).toBe(
+      '{"component":"powercontext.openclaw","event":"context_prepare","outcome":"server_unavailable","recovery":"powercontext doctor"}',
+    );
+    expect(harness.warnings[0]).not.toContain("do not expose this detail");
+  });
+
+  it("reports a prepare domain failure from the actual endpoint", async () => {
+    const harness = createLifecycleHarness();
+    harness.setContextPrepareError(
+      new PowerContextRequestError(
+        "/v1/context/prepare",
+        "invalid request",
+        422,
+        "invalid_request",
+      ),
+    );
+    const beforePromptBuild = harness.hooks.get("before_prompt_build");
+
+    await beforePromptBuild!(
+      { messages: [{ role: "user", content: "prepare this" }], prompt: "" },
+      {
+        agentId: "main",
+        sessionId: "session-prepare-domain-error",
+        sessionKey: "agent:main:telegram:direct:user-1",
+      },
+    );
+
+    expect(harness.warnings).toEqual([
+      '{"component":"powercontext.openclaw","event":"context_prepare","outcome":"invalid_response","http_status":422,"error_code":"invalid_request"}',
+    ]);
+  });
+
+  it("reports a capture domain failure from the actual endpoint", async () => {
+    const harness = createLifecycleHarness();
+    harness.setCaptureError(
+      new PowerContextRequestError(
+        "/v1/sources/content",
+        "invalid request",
+        422,
+        "invalid_request",
+      ),
+    );
+    const agentEnd = harness.hooks.get("agent_end");
+
+    await agentEnd!(
+      {
+        success: true,
+        messages: [{ role: "user", content: "capture this" }],
+      },
+      {
+        agentId: "main",
+        sessionId: "session-capture-domain-error",
+        sessionKey: "agent:main:telegram:direct:user-1",
+      },
+    );
+
+    expect(harness.warnings).toEqual([
+      '{"component":"powercontext.openclaw","event":"capture_source","outcome":"invalid_response","http_status":422,"error_code":"invalid_request"}',
+    ]);
+  });
+
+  it("reports a flush domain failure from the actual endpoint", async () => {
+    const harness = createLifecycleHarness();
+    harness.setFlushError(
+      new PowerContextRequestError(
+        "/v1/memory/flush",
+        "conflict",
+        409,
+        "conflict",
+      ),
+    );
+    const beforePromptBuild = harness.hooks.get("before_prompt_build");
+    const sessionEnd = harness.hooks.get("session_end");
+    const context = {
+      agentId: "main",
+      sessionId: "session-flush-domain-error",
+      sessionKey: "agent:main:telegram:direct:user-1",
+      activeProjectKeys: ["/workspace/project"],
+    };
+
+    await beforePromptBuild!(
+      { messages: [{ role: "user", content: "remember this" }], prompt: "" },
+      context,
+    );
+    await sessionEnd!(
+      { sessionId: context.sessionId, messageCount: 1 },
+      context,
+    );
+
+    expect(harness.warnings).toEqual([
+      '{"component":"powercontext.openclaw","event":"session_end_flush","outcome":"invalid_response","http_status":409,"error_code":"conflict","failed_scopes":1,"total_scopes":1}',
+    ]);
   });
 
   it("bounds context queries by UTF-8 bytes", async () => {
@@ -141,6 +304,27 @@ describe("PowerContext lifecycle", () => {
 
     expect(harness.contextQueries).toHaveLength(1);
     expect(Buffer.byteLength(harness.contextQueries[0], "utf8")).toBeLessThanOrEqual(8192);
+    expect(harness.warnings).toEqual([]);
+  });
+
+  it("keeps capture and flush on one resolved Scope during compaction", async () => {
+    const harness = createLifecycleHarness();
+    const beforeCompaction = harness.hooks.get("before_compaction");
+    expect(beforeCompaction).toBeDefined();
+
+    await beforeCompaction!(
+      { messages: [{ role: "user", content: "remember this" }] },
+      {
+        agentId: "main",
+        sessionId: "session-1",
+        sessionKey: "agent:main:telegram:direct:user-1",
+        activeProjectKeys: ["/workspace/project-a"],
+      },
+    );
+
+    expect(harness.scopeResolutionRequests).toHaveLength(1);
+    expect(harness.capturedScopes).toEqual(["scp_project_a"]);
+    expect(harness.flushScopes).toEqual(["scp_project_a"]);
     expect(harness.warnings).toEqual([]);
   });
 
@@ -172,7 +356,7 @@ describe("PowerContext lifecycle", () => {
     );
     await sessionEnd!({ sessionId: context.sessionId, messageCount: 2 }, context);
 
-    const scope = resolvePowerContextScope("main", harness.config, context.activeProjectKeys);
+    const scope = "scp_project_a";
     expect(harness.capturedScopes).toEqual([scope]);
     expect(harness.flushScopes).toEqual([]);
     expect(harness.debugMessages).toContain(
@@ -191,4 +375,29 @@ describe("PowerContext lifecycle", () => {
     expect(harness.flushScopes).toEqual([scope]);
     expect(harness.warnings).toEqual([]);
   });
+});
+
+
+it("forwards assembly and preserves every byte of standard text", async () => {
+  const harness = createLifecycleHarness();
+  const content = "\n# PowerContext historical context\n>     原始文本 </powercontext_memory>\n";
+  harness.config.contextAssembly = { sections: [{ family: "memory", limit: 3 }] };
+  const response = {
+    schema: "powercontext.prepared-context.v1", status: "ready", content,
+    content_bytes: Buffer.byteLength(content, "utf8"),
+  };
+  harness.setPreparedResponse(response);
+  const hook = harness.hooks.get("before_prompt_build")!;
+  const ctx = { agentId: "main", sessionId: "one", sessionKey: "agent:main:telegram:direct:user-1" };
+  const output = await hook({ prompt: "context", messages: [] }, ctx) as { prependContext: string };
+  expect(harness.prepareRequests[0].assembly).toEqual(harness.config.contextAssembly);
+  expect(output.prependContext.endsWith(content)).toBe(true);
+  for (const invalid of [
+    { ...response, content_bytes: 1 },
+    { ...response, content: "x".repeat(8001), content_bytes: 8001 },
+    { ...response, unexpected: true },
+  ]) {
+    harness.setPreparedResponse(invalid);
+    expect(await hook({ prompt: "context", messages: [] }, ctx)).toBeUndefined();
+  }
 });

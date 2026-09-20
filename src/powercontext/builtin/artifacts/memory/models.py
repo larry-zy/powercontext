@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import ClassVar, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
 
 from powercontext.artifacts import Artifact, ArtifactRef
+from powercontext.artifacts import MemoryCitation as MemoryCitation
+from powercontext.builtin.artifacts.search import AdmissionCounts
 from powercontext.builtin.inference.models import InferenceUsage
 from powercontext.sources import Source, SourceRef
 
@@ -41,12 +44,28 @@ class EmbeddingProfile(BaseModel):
     normalization: Literal["none", "unit"] = "unit"
 
 
+@dataclass(frozen=True)
+class MemoryQueryEmbedding:
+    """One already-computed query vector together with the profile it was computed under.
+
+    Carried back out of :meth:`MemoryService.search` so a later recall round can reuse the
+    round-0 vector instead of paying for a second embedding call. The profile is part of the
+    value because a vector is only meaningful against the profile that produced it: reusing a
+    vector across profiles would silently compare incompatible spaces, so a mismatch is
+    treated as "reuse unavailable" and the round pays for a fresh embedding.
+    """
+
+    query_vector: tuple[float, ...]
+    embedding_profile: EmbeddingProfile
+
+
 class MemoryCapabilities(BaseModel):
     """Backend features available for the configured deployment."""
 
     fts: bool
     vector: bool = False
     hybrid: bool = False
+    tag_filter: bool = False
     embedding_profile: EmbeddingProfile | None = None
 
 
@@ -161,16 +180,19 @@ class MemoryRerankTrace(BaseModel):
 
 
 class MemorySearchResult(BaseModel):
-    """Search hits together with the mode actually executed."""
+    """Search hits together with the mode actually executed.
+
+    The last four fields are **in-process only**: they exist so the Runtime's recall gate can
+    account for what one search cost and admitted. They are ``exclude=True`` as
+    defence-in-depth so a future ``model_dump`` cannot leak a gate artefact into a response;
+    the HTTP projection is independently safe because ``search_response`` enumerates
+    ``MemorySearchPage``'s fields explicitly.
+    """
 
     mode: MemoryUsedSearchMode
     hits: tuple[MemoryHit, ...] = ()
     rerank: MemoryRerankTrace | None = None
-
-
-class MemoryCitation(BaseModel):
-    """A stable Handoff anchor for one exact entry version."""
-
-    memory_ref: ArtifactRef
-    entry_id: str
-    entry_version_id: str
+    admission: AdmissionCounts | None = Field(default=None, exclude=True)
+    embedding_calls: int = Field(default=0, exclude=True)
+    generation_calls: int = Field(default=0, exclude=True)
+    query_embedding: MemoryQueryEmbedding | None = Field(default=None, exclude=True)

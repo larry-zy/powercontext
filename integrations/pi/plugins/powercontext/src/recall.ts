@@ -25,6 +25,7 @@ export interface PluginRuntime {
   resolveScope: (cwd: string) => Promise<string>
   recordCapture?: (scopeId: string, position: number) => void
   flushPending?: (signal?: AbortSignal) => Promise<void>
+  diagnostic?: (event: string, error: unknown) => void
 }
 
 export interface BeforeAgentStartInput {
@@ -59,8 +60,19 @@ export async function recallBeforeAgentStart(input: BeforeAgentStartInput): Prom
   const prompt = input.prompt.trim()
   if (!prompt) return undefined
 
+  let scopeId: string
   try {
-    const scopeId = await input.runtime.resolveScope(input.cwd)
+    scopeId = await input.runtime.resolveScope(input.cwd)
+  } catch (error) {
+    try {
+      input.runtime.diagnostic?.('context_prepare', error)
+    } catch {
+      // Diagnostics are best effort and must not affect the turn.
+    }
+    return undefined
+  }
+
+  try {
     const signals = [createTimeoutSignal(input.runtime.config.httpBudgetMs)]
     if (input.signal) signals.push(input.signal)
     const signal = combineSignals(signals)
@@ -70,14 +82,20 @@ export async function recallBeforeAgentStart(input: BeforeAgentStartInput): Prom
         scope_id: scopeId,
         query: prompt,
         max_bytes: input.runtime.config.maxBytes,
+        ...(input.runtime.config.contextAssembly === undefined ? {} : { assembly: input.runtime.config.contextAssembly }),
       }, signal)
       const prepared = validatePreparedContext(
         response.kind === 'json' ? response.value : undefined,
         input.runtime.config.maxBytes,
       )
       content = prepared.status === 'ready' && typeof prepared.content === 'string' ? prepared.content : undefined
-    } catch {
+    } catch (error) {
       // Recall is an optional augmentation and must not block Pi.
+      try {
+        input.runtime.diagnostic?.('context_prepare', error)
+      } catch {
+        // Diagnostics are best effort and must not affect the turn.
+      }
     }
 
     const position = await captureUserPrompt({
@@ -90,6 +108,7 @@ export async function recallBeforeAgentStart(input: BeforeAgentStartInput): Prom
       turnId: nextTurnId(input.branch),
       signal,
       onFlushFailure: (position) => input.runtime.recordCapture?.(scopeId, position),
+      onFailure: (event, error) => input.runtime.diagnostic?.(event, error),
     })
     if (position !== undefined && !input.runtime.config.flushOnCapture) {
       input.runtime.recordCapture?.(scopeId, position)

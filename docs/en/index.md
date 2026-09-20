@@ -1,50 +1,79 @@
 ---
-template: home.html
 title: PowerContext
-description: Keep project decisions, constraints, and next steps available across Codex and Claude Code sessions.
-hide:
-  - navigation
-  - toc
-  - footer
+description: Keep project knowledge and active work available across people, agents, and sessions.
 home:
   hero:
-    label: Open source · Project scoped · Local by default
+    label: Open source · local-first
     title:
-      - Start a new session.
-      - Keep moving.
-    lead: PowerContext keeps project decisions, constraints, and next steps outside the chat. When Codex or Claude Code opens the project again, the relevant context is ready.
-    note: Codex, Claude Code, Python, HTTP, and MCP share the same project Memory.
+      - Keep work moving
+      - across sessions.
+    lead: PowerContext keeps decisions, constraints, evidence, and current progress with the project. When a person or agent takes over, they can verify the state and continue without reconstructing the last conversation.
     actions:
-      - label: Start with Codex
-        href: en/docs/tutorials/codex-quickstart/
+      - label: Install and get started
+        href: en/docs/get-started/quickstart/
         kind: primary
-      - label: How context carries over
-        href: en/docs/explanation/memory-and-handoff/
+      - label: How it works
+        href: en/docs/get-started/core-concepts/
         kind: secondary
-  continuity:
-    label: One project, two sessions
-    title: Do not start from scratch.
-    lead: Record a decision once. The next session can recover it with its source and exact revision.
+  onboarding:
+    title: From installation to your first memory
+    lead: Start with a Server, configure the capabilities you need, then connect your Agent. The guide covers local use and access from another device.
+    preview_label: Guided setup preview.
+    preview_note: These instructions use the official oceanbase/powercontext master branch.
+    repository_label: View this source branch
+    guide_label: Follow the complete guide
     steps:
-      - title: Save
-        description: In Codex, record that a Handoff stays temporary until the user asks to commit it.
-      - title: Continue
-        description: Open the same project in Claude Code without replaying the earlier chat.
-      - title: Check
-        description: Recover the rule together with its source and exact revision.
-  ownership:
-    label: Memory and Handoff
+      - title: Install PowerContext
+        description: Use Python 3.11 or later, Git, and uv. Install this branch on the machine that will run the Server.
+        command: uv tool install --force "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@master"
+      - title: Follow the configuration wizard
+        description: Choose your storage, access scenario, memory capabilities, Dashboard, and Agents. It writes configuration files and tailored next steps.
+        command: powercontext config init
+      - title: Start the Server
+        description: Run from the directory containing your generated .env. Open the Dashboard URL and use the token shown by the wizard, if enabled.
+        command: powercontext server run --env-file .env
+      - title: Connect your Agent and verify memory
+        description: Follow .env.next-steps.md to create or select a Scope and connect your Agent. Verify that a real conversation becomes a Source, then check memory processing if enabled.
+  continuity:
+    title: The session ends before the work does.
+    lead: You make a decision, change the code, and stop before the task is complete. PowerContext keeps the useful context with the project so the next session can continue from the current state.
+    visual_label: How PowerContext carries context from one work session to the next
+    steps:
+      - title: Current session
+        items:
+          - Decisions
+          - Constraints
+          - Evidence
+          - Verified progress
+      - title: PowerContext
+        items:
+          - Memory
+          - Handoff
+      - title: Next session
+        items:
+          - Relevant context
+          - Current objective
+          - Source links
+          - Next action
+  ecosystem:
     title:
-      - Keep what lasts.
-      - Hand off the work.
-    lead: Memory keeps decisions, constraints, conventions, and next steps in a searchable history. Revise or retire an entry without losing the record.
-    handoff: A Handoff captures the current objective, verified progress, blockers, and next action. Commit it when the work becomes a project milestone.
-    result: "LOCOMO: 90.78% correct · 1.38 s p95 search latency"
-    command: powercontext server run
-    primary_action:
-      label: Read the quickstart
-      href: en/docs/tutorials/codex-quickstart/
-    secondary_action:
-      label: Explore documentation
-      href: en/docs/
+      - The work changes hands.
+      - The context stays.
+    lead: A task may start in one agent and continue in another. PowerContext keeps its knowledge, progress, and proven methods with the project so the next agent can pick up from the current state.
+    visual_label: A task moves between agents while PowerContext keeps its project artifacts available
+    agents_label: Work begins in a connected agent
+    all_agents_label: View all supported agents
+    docs_label: Open setup guide
+    runtime_label: Context accumulates within the project scope
+    artifacts_label: The work leaves reusable artifacts
+    artifacts:
+      - name: Memory
+        description: Durable knowledge
+      - name: Handoff
+        description: Active task state
+      - name: Experience
+        description: Reviewed approach
+      - name: Skill
+        description: Exported procedure
+    output_label: A different agent continues the work
 ---

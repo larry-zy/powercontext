@@ -34,11 +34,11 @@ if (existsSync(built) && !force) {
   process.exit(0)
 }
 
-const gen = run('gen-operations.mjs')
-if (gen.status !== 0) process.exit(gen.status ?? 1)
-
 const tsdown = spawnSync('tsdown', { cwd: root, stdio: 'inherit', shell: true })
-if (tsdown.status === 0) process.exit(0)
+if (tsdown.status === 0) {
+  const normalize = run('normalize-build-output.mjs')
+  process.exit(normalize.status ?? 1)
+}
 if (existsSync(built)) {
   console.warn('powercontext-dsh: tsdown unavailable; using prebuilt lib/')
   process.exit(0)

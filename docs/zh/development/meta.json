@@ -1,0 +1,14 @@
+{
+  "title": "开发",
+  "collapsible": true,
+  "defaultOpen": false,
+  "pages": [
+    "core-protocol",
+    "memory-layer",
+    "plugin-contract",
+    "pydantic-ai-inference",
+    "remote-access-implementation",
+    "dashboard",
+    "desktop-delivery-plan"
+  ]
+}

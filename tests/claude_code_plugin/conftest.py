@@ -30,7 +30,9 @@ _PLUGIN_MODULE_NAMES = (
     "hooks",
     "hooks.prepared_context",
     "scripts",
-    "scripts.project_scope",
+    "scripts.workspace_scope",
+    "workspace_scope",
+    "powercontext_claude_code_statusline",
 )
 
 
@@ -73,11 +75,16 @@ def hook_module(plugin_imports: None) -> ModuleType:
     )
 
 
+@pytest.fixture(autouse=True)
+def isolated_diagnostic_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("POWERCONTEXT_DIAGNOSTIC_STATE_FILE", str(tmp_path / "claude-code-diagnostics.json"))
+
+
 @pytest.fixture
 def scope_module(plugin_imports: None) -> ModuleType:
     return _load_module(
         "powercontext_claude_code_scope",
-        PLUGIN_ROOT / "scripts" / "project_scope.py",
+        PLUGIN_ROOT / "scripts" / "workspace_scope.py",
     )
 
 
@@ -86,4 +93,12 @@ def settings_module(plugin_imports: None) -> ModuleType:
     return _load_module(
         "claude_code_settings",
         PLUGIN_ROOT / "claude_code_settings.py",
+    )
+
+
+@pytest.fixture
+def statusline_module(plugin_imports: None) -> ModuleType:
+    return _load_module(
+        "powercontext_claude_code_statusline",
+        PLUGIN_ROOT / "scripts" / "statusline.py",
     )

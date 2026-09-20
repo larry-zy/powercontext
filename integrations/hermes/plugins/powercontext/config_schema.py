@@ -47,11 +47,18 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             inline=True,
         ),
         ProviderField(
+            key="allow_insecure_http",
+            label="Allow unencrypted HTTP",
+            kind=KIND_BOOL,
+            env_key="POWERCONTEXT_HERMES_ALLOW_INSECURE_HTTP",
+            description="Explicitly allow HTTP to the configured non-loopback server; does not disable TLS verification.",
+        ),
+        ProviderField(
             key="scope_id",
-            label="Memory scope template",
+            label="Explicit Scope ID",
             kind=KIND_TEXT,
-            default="hermes:{profile}:{user_id}",
-            description="Supports {profile}, {agent_identity}, {user_id}, and {hermes_home}.",
+            default="",
+            description="Optional server-owned Scope selected before durable bindings and the server default.",
         ),
         ProviderField(
             key="max_bytes",
@@ -59,6 +66,14 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             kind=KIND_NUMBER,
             default="8000",
             description="Bounded context returned by /v1/context/prepare.",
+        ),
+        ProviderField(
+            key="context_assembly",
+            label="Context text assembly (JSON)",
+            kind=KIND_TEXT,
+            env_key="POWERCONTEXT_HERMES_CONTEXT_ASSEMBLY",
+            default="",
+            description="Optional JSON object selecting context sections, order, limits, and metadata. Use {} for standard text.",
         ),
         ProviderField(
             key="timeout",
@@ -87,6 +102,19 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             kind=KIND_BOOL,
             default="true",
             description="Run bounded memory extraction when the Hermes session ends.",
+        ),
+        ProviderField(
+            key="evaluation_trace",
+            label="Evaluation trace",
+            kind=KIND_BOOL,
+            default="false",
+            description="Record recalled context in per-session local JSONL files.",
+        ),
+        ProviderField(
+            key="evaluation_trace_path",
+            label="Evaluation trace directory",
+            kind=KIND_TEXT,
+            description="Optional directory for per-session evaluation trace files.",
         ),
     ),
 )

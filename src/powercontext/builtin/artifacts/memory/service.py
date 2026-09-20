@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Literal, Protocol, TypeAlias, TypeVar, overload
@@ -61,6 +62,7 @@ from powercontext.builtin.artifacts.memory.models import (
     MemoryHit,
     MemoryManifest,
     MemoryManifestEntry,
+    MemoryQueryEmbedding,
     MemoryRerankTrace,
     MemoryRevisionChanges,
     MemorySearchMode,
@@ -77,13 +79,15 @@ from powercontext.builtin.artifacts.memory.protocols import (
     MemoryWritePlan,
 )
 from powercontext.builtin.artifacts.memory.reranking import MemoryReranker
-from powercontext.builtin.artifacts.search import analyze_text
+from powercontext.builtin.artifacts.prompt.service import ScopedPrompts, current_prompt, prompt_operation
+from powercontext.builtin.artifacts.search import AdmissionCounts, AdmissionFloor, analyze_text
 from powercontext.builtin.inference import (
     EmbeddingModel,
     EmbeddingVector,
     InferenceTimeoutError,
     InferenceUnavailableError,
 )
+from powercontext.builtin.tags import TagFilter
 from powercontext.errors import RevisionConflictError
 from powercontext.sources import Source, SourceRef
 
@@ -136,6 +140,16 @@ class _InvalidMemoryOperationError(ValueError):
         super().__init__(messages[code])
 
 
+def _extraction_prompt_refs() -> tuple[ArtifactRef, ...]:
+    selection = current_prompt("memory.extract")
+    return () if selection is None or selection.artifact is None else (selection.artifact,)
+
+
+def _require_tag_filter(capabilities: MemoryCapabilities, tag_filter: TagFilter | None) -> None:
+    if tag_filter is not None and not capabilities.tag_filter:
+        raise CapabilityNotSupportedError("tag-filter")
+
+
 class MemoryService:
     """Validate and orchestrate Memory operations without exposing storage details."""
 
@@ -150,8 +164,10 @@ class MemoryService:
         source_resolver: _SourceResolver | None = None,
         artifact_resolver: _ArtifactResolver | None = None,
         id_factory: IdFactory | None = None,
+        prompt_context: ScopedPrompts | None = None,
     ) -> None:
         self._backend = backend
+        self._prompt_context = prompt_context
         self._candidate_pipeline = candidate_pipeline
         self._embedding_model = embedding_model
         if rerank_candidate_limit < 1:
@@ -191,6 +207,18 @@ class MemoryService:
         """Return the current Memory head by its stable Artifact identity."""
 
         return await self._backend.latest(artifact_id)
+
+    async def head_entries(self, artifact_id: str, /) -> tuple[Memory, tuple[MemoryEntryVersion, ...]]:
+        """Return the current Memory head together with its validated entry objects.
+
+        ``entries`` re-reads the caller's Memory to prove it matches storage, which a head
+        read straight from the backend already satisfies. Callers that need both the head
+        and its entries use this instead, so a read-only pass over many Scopes does not
+        re-fetch every Memory Revision it just loaded.
+        """
+
+        memory = await self._backend.latest(artifact_id)
+        return memory, await self._validated_entries(memory)
 
     async def revision(self, memory: ArtifactRef, /) -> Memory:
         """Return one exact Memory Revision by its stable reference."""
@@ -234,34 +262,40 @@ class MemoryService:
             has_entries=bool(entries),
             has_evidence=bool(sources or artifacts),
         )
-        base = await self._canonical_base(memory)
-        evidence = await self._canonical_operation_evidence(sources, artifacts)
-        current_entries = () if base is None else await self._validated_entries(base)
-        candidates = await self._candidates(
-            selected_mode,
-            tuple(entries),
-            evidence,
-            current_entries,
-            active_version_ids=(
-                frozenset()
-                if base is None
-                else frozenset(
-                    item.entry_version_id for item in base.content.manifest.entries if item.state == "active"
-                )
-            ),
+        binding = (
+            self._prompt_context.service.bind(self._prompt_context.scope_id, "memory.extract")
+            if selected_mode == "extract" and self._prompt_context is not None
+            else nullcontext()
         )
-        if not candidates:
-            return MemoryWritePlan(result=base, commit=None)
+        async with binding:
+            base = await self._canonical_base(memory)
+            evidence = await self._canonical_operation_evidence(sources, artifacts)
+            current_entries = () if base is None else await self._validated_entries(base)
+            candidates = await self._candidates(
+                selected_mode,
+                tuple(entries),
+                evidence,
+                current_entries,
+                active_version_ids=(
+                    frozenset()
+                    if base is None
+                    else frozenset(
+                        item.entry_version_id for item in base.content.manifest.entries if item.state == "active"
+                    )
+                ),
+            )
+            if not candidates:
+                return MemoryWritePlan(result=base, commit=None)
 
-        commit = await self._prepare_commit(
-            base=base,
-            candidates=candidates,
-            evidence=evidence,
-            current_entries=current_entries,
-        )
-        if commit is None:
-            return MemoryWritePlan(result=base, commit=None)
-        return MemoryWritePlan(result=commit.memory, commit=commit)
+            commit = await self._prepare_commit(
+                base=base,
+                candidates=candidates,
+                evidence=evidence,
+                current_entries=current_entries,
+            )
+            if commit is None:
+                return MemoryWritePlan(result=base, commit=None)
+            return MemoryWritePlan(result=commit.memory, commit=commit)
 
     async def apply(self, plan: MemoryWritePlan, /) -> Memory | None:
         """Apply one prepared write through this service's transaction boundary."""
@@ -373,6 +407,7 @@ class MemoryService:
                 )
         return await self._backend.changes(target.as_ref(), since_revision)
 
+    @prompt_operation("memory.rerank")
     async def search(
         self,
         query: str,
@@ -380,8 +415,22 @@ class MemoryService:
         memories: Sequence[Memory],
         limit: int = 10,
         mode: MemorySearchMode = "auto",
+        tag_filter: TagFilter | None = None,
+        admission: AdmissionFloor | None = None,
+        query_embedding: MemoryQueryEmbedding | None = None,
     ) -> MemorySearchResult:
-        """Search explicit current Memory heads with capability-safe fallback."""
+        """Search explicit current Memory heads with capability-safe fallback.
+
+        ``admission=None`` applies the historical fusion-time thresholds bit for bit.
+
+        ``query_embedding`` lets a caller reuse a vector it already paid for (RFC 1560's
+        expansion rounds reuse the round-0 vector). Reuse is best-effort and honest: it is
+        applied only when the supplied profile equals the one this search resolved, and the
+        call reports ``embedding_calls = 0`` in that case, ``1`` when it embedded. The
+        resolved vector is handed back on :attr:`MemorySearchResult.query_embedding` so the
+        next round can reuse it. When the mode resolved to ``fts`` there is no vector to
+        report, so the field stays ``None`` and the next round must pay again.
+        """
 
         if not memories:
             raise _InvalidMemoryOperationError("search-memories")
@@ -397,6 +446,7 @@ class MemoryService:
         selected_memories = tuple(memory.as_ref() for memory in selected)
         await self._validate_search_heads(selected)
         capabilities = await self._backend.capabilities()
+        _require_tag_filter(capabilities, tag_filter)
         selected_mode = await self._select_search_mode(
             mode,
             memories=selected_memories,
@@ -405,6 +455,8 @@ class MemoryService:
         normalized_query = normalize_text(query)
         query_vector = None
         profile = None
+        embedding_calls = 0
+        resolved_embedding: MemoryQueryEmbedding | None = None
         if selected_mode in {"vector", "hybrid"}:
             profile = capabilities.embedding_profile
             if profile is None:
@@ -414,17 +466,21 @@ class MemoryService:
                     selected_mode,
                     "cosine admission requires a unit-normalized L2 embedding profile",
                 )
-            try:
-                query_vector = (await self._embed_texts((normalized_query,), profile))[0]
-            except (InferenceUnavailableError, InferenceTimeoutError) as error:
-                if mode == "auto" and capabilities.fts:
-                    selected_mode = "fts"
-                    profile = None
-                else:
-                    raise CapabilityNotSupportedError(
-                        selected_mode,
-                        "embedding model is temporarily unavailable",
-                    ) from error
+            (
+                selected_mode,
+                query_vector,
+                resolved_embedding,
+                embedding_calls,
+            ) = await self._resolve_query_vector(
+                query=normalized_query,
+                requested_mode=mode,
+                selected_mode=selected_mode,
+                profile=profile,
+                capabilities=capabilities,
+                reuse=query_embedding,
+            )
+            if resolved_embedding is None:
+                profile = None
         coarse_limit = limit if self._reranker is None else max(limit, self._rerank_candidate_limit)
         request = MemorySearchRequest(
             query=normalized_query,
@@ -434,10 +490,11 @@ class MemoryService:
             mode=selected_mode,
             query_vector=query_vector,
             embedding_profile=profile,
+            tag_filter=tag_filter,
         )
         channels = await self._backend.search(request)
-        admitted_fts = admit_fts_candidates(normalized_query, channels.fts)
-        admitted_vector = admit_vector_candidates(channels.vector)
+        admitted_fts = admit_fts_candidates(normalized_query, channels.fts, admission=admission)
+        admitted_vector = admit_vector_candidates(channels.vector, admission=admission)
         hits = fuse_rankings(
             fts=admitted_fts if selected_mode in {"fts", "hybrid"} else (),
             vector=admitted_vector if selected_mode in {"vector", "hybrid"} else (),
@@ -448,6 +505,53 @@ class MemoryService:
             query=normalized_query,
             hits=hits,
             limit=limit,
+            admission=AdmissionCounts(
+                family=Memory.family,
+                scope_id="",
+                retrieved=len(channels.fts) + len(channels.vector),
+                admitted=len(admitted_fts) + len(admitted_vector),
+            ),
+            embedding_calls=embedding_calls,
+            query_embedding=resolved_embedding,
+        )
+
+    async def _resolve_query_vector(
+        self,
+        *,
+        query: str,
+        requested_mode: MemorySearchMode,
+        selected_mode: MemoryUsedSearchMode,
+        profile: EmbeddingProfile,
+        capabilities: MemoryCapabilities,
+        reuse: MemoryQueryEmbedding | None,
+    ) -> tuple[MemoryUsedSearchMode, tuple[float, ...] | None, MemoryQueryEmbedding | None, int]:
+        """Resolve — or reuse — the query vector for a vector or hybrid search.
+
+        Returns ``(selected_mode, query_vector, resolved_embedding, embedding_calls)``.
+        ``resolved_embedding`` is ``None`` exactly when the search fell back to ``fts``, which
+        is also when the caller must drop the embedding profile from the backend request.
+
+        Reuse applies only when the supplied profile equals the resolved one; otherwise the
+        round embeds and reports one call. A failed embedding is still counted as one call,
+        because the call was issued — the cost is real even though it produced nothing.
+        """
+
+        if reuse is not None and reuse.embedding_profile == profile:
+            return selected_mode, reuse.query_vector, reuse, 0
+        try:
+            query_vector = (await self._embed_texts((query,), profile))[0]
+        except (InferenceUnavailableError, InferenceTimeoutError) as error:
+            if requested_mode == "auto" and capabilities.fts:
+                return "fts", None, None, 1
+            raise CapabilityNotSupportedError(
+                selected_mode,
+                "embedding model is temporarily unavailable",
+            ) from error
+        return (
+            selected_mode,
+            query_vector,
+            MemoryQueryEmbedding(query_vector=query_vector, embedding_profile=profile),
+            1,
         )
 
     async def _reranked_search_result(
@@ -457,9 +561,26 @@ class MemoryService:
         query: str,
         hits: tuple[MemoryHit, ...],
         limit: int,
+        admission: AdmissionCounts | None = None,
+        embedding_calls: int = 0,
+        query_embedding: MemoryQueryEmbedding | None = None,
     ) -> MemorySearchResult:
+        """Apply the optional reranker and report what this search paid and admitted.
+
+        ``generation_calls`` counts the RFC 0080 rerank call this search actually issued: ``1``
+        when the reranker ran over a non-empty pool, ``0`` otherwise. It is never inferred
+        from configuration — a deployment whose rerank flag is on but whose reranker did not
+        run reports ``0``, which is the honest number.
+        """
+
         if self._reranker is None or not hits:
-            return MemorySearchResult(mode=mode, hits=hits[:limit])
+            return MemorySearchResult(
+                mode=mode,
+                hits=hits[:limit],
+                admission=admission,
+                embedding_calls=embedding_calls,
+                query_embedding=query_embedding,
+            )
         rerank_started = perf_counter()
         decision = await self._reranker.rerank(
             query,
@@ -480,6 +601,10 @@ class MemoryService:
                 latency_ms=rerank_latency_ms,
                 usage=decision.usage,
             ),
+            admission=admission,
+            embedding_calls=embedding_calls,
+            generation_calls=1,
+            query_embedding=query_embedding,
         )
 
     async def expand(
@@ -505,11 +630,18 @@ class MemoryService:
             )
         return versions
 
-    async def entries(self, memory: Memory, /) -> tuple[MemoryEntryVersion, ...]:
+    async def entries(
+        self, memory: Memory, /, *, tag_filter: TagFilter | None = None
+    ) -> tuple[MemoryEntryVersion, ...]:
         """Return the entry objects referenced by one exact current Memory head."""
 
         canonical = await self._canonical_memory(memory)
-        return await self._validated_entries(canonical)
+        entries = await self._validated_entries(canonical)
+        if tag_filter is None:
+            return entries
+        _require_tag_filter(await self._backend.capabilities(), tag_filter)
+        matching = await self._backend.tagged_entry_ids(canonical.as_ref(), tag_filter)
+        return tuple(entry for entry in entries if entry.entry_id in matching)
 
     async def rebuild_projections(self, embedding_model: EmbeddingModel | None = None, /) -> None:
         """Rebuild current-head search projections from authoritative Memory revisions."""
@@ -908,6 +1040,8 @@ class MemoryService:
 
         canonical_artifacts: list[Artifact[object]] = []
         for artifact in artifacts:
+            if artifact.family == "prompt":
+                raise InvalidMemoryEvidenceError("prompt-configuration")
             if self._artifact_resolver is None:
                 raise InvalidMemoryEvidenceError("artifact-resolver")
             _append_unique(canonical_artifacts, await self._artifact_resolver.get(artifact))
@@ -1058,7 +1192,7 @@ class MemoryService:
             content=content,
             lineage=ArtifactLineage(
                 sources=self._source_refs(evidence.sources),
-                artifacts=tuple(artifact.as_ref() for artifact in evidence.artifacts),
+                artifacts=tuple(artifact.as_ref() for artifact in evidence.artifacts) + _extraction_prompt_refs(),
             ),
         )
         projections = await self._prepare_projections(

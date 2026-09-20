@@ -63,6 +63,8 @@ from powercontext.builtin.persistence.tables import (
     MEMORY_ENTRY_HEADS_TABLE,
     MEMORY_ENTRY_VERSIONS_TABLE,
 )
+from powercontext.builtin.persistence.tags import tag_predicate
+from powercontext.builtin.tags import TagFilter
 from powercontext.errors import ArtifactNotFoundError
 from powercontext.sources import SourceRef
 
@@ -153,6 +155,28 @@ class RelationalMemoryBackend:
             except RepositoryNotFoundError:
                 raise ArtifactNotFoundError(artifact_id) from None
         return _require_memory(artifact)
+
+    async def tagged_entry_ids(self, memory: ArtifactRef, tag_filter: TagFilter) -> frozenset[str]:
+        canonical = await self.get(memory)
+        versions = tuple(entry.entry_version_id for entry in canonical.content.manifest.entries)
+        table = MEMORY_ENTRY_VERSIONS_TABLE
+        async with self._database.connection(self._bound_connection) as connection:
+            rows = await connection.scalars(
+                select(table.c.entry_id).where(
+                    table.c.scope_id == self._scope_id,
+                    table.c.memory_artifact_id == memory.artifact_id,
+                    table.c.entry_version_id.in_(versions),
+                    tag_predicate(
+                        self._scope_id,
+                        "memory",
+                        table.c.memory_artifact_id,
+                        "memory_entry",
+                        table.c.entry_id,
+                        tag_filter,
+                    ),
+                )
+            )
+            return frozenset(rows)
 
     async def entries(self, memory: ArtifactRef, /) -> tuple[MemoryEntryVersion, ...]:
         canonical = await self.get(memory)
@@ -469,6 +493,10 @@ class RelationalMemoryBackend:
                 insert(MEMORY_ENTRY_VERSIONS_TABLE),
                 [_entry_values(self._scope_id, entry) for entry in value.entry_versions],
             )
+        # Clear the index before the heads go, as rebuild_projections does: index
+        # metadata may cascade from the heads, and an index can only find its
+        # rows through that metadata.
+        await self._index.replace(connection, self._scope_id, value.memory.as_ref(), ())
         await connection.execute(
             delete(MEMORY_ENTRY_HEADS_TABLE).where(
                 MEMORY_ENTRY_HEADS_TABLE.c.scope_id == self._scope_id,

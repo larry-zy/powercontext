@@ -39,11 +39,11 @@ from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import StepResult
 from powercontext.client import PowerContextClient
 from powercontext.client.settings import ClientSettings
-from powercontext.http import ListMemoryEntriesRequest, PrepareContextRequest
+from powercontext.http import CreateScopeRequest, ListMemoryEntriesRequest, PrepareContextRequest
 
 from .artifacts import write_artifacts
 from .catalog import E2ETask, MemoryEvaluationSpec, OutcomeEvaluationSpec
-from .evaluation import evaluate_observation
+from .evaluation import evaluate_observation, matches_forbidden_context
 from .evidence import fingerprint, load_resolved_instructions, redact, write_evaluation_report, write_evidence
 from .harbor_agent import BUB_ACP_SERVER_VERSION, BUB_VERSION
 from .models import (
@@ -217,30 +217,42 @@ async def run_task_group(
         else None
     )
     run_id = _run_id(tasks)
-    scopes = {task.id: f"e2e:{run_id}:{task.id}" if runtime else f"e2e:{run_id}" for task in tasks}
-    runs = {task.id: TaskRun(task, run_id, scopes[task.id], datetime.now(UTC), MemorySnapshot()) for task in tasks}
-    invocation_scopes = (
-        tuple(scopes[source.task.id] for source in runtime.sources for _ in source.runtime_steps) if runtime else ()
-    )
-    job_config = _job_config(
-        tasks[0],
-        run_id,
-        scopes[tasks[0].id],
-        output_dir,
-        settings,
-        runtime=runtime,
-        invocation_scopes=invocation_scopes,
-    )
     harbor = HarborTrialObservation()
     step_results: tuple[StepResult, ...] = ()
     trial_dir: Path | None = None
     execution_errors: list[str] = []
 
     async with _powercontext_client() as client:
+        memory_tasks = tuple(task for task in tasks if isinstance(task.evaluation, MemoryEvaluationSpec))
+        if memory_tasks:
+            await client.get_readiness()
+        started_at = datetime.now(UTC)
+        scopes = {
+            task.id: (
+                await client.create_scope(
+                    CreateScopeRequest(
+                        title=f"E2E workload: {task.id}",
+                        summary=f"Isolated Scope for the {task.id} workload in E2E run {run_id}.",
+                        idempotency_key=f"e2e:{run_id}:{task.id}",
+                    )
+                )
+            ).scope_id
+            for task in tasks
+        }
+        runs = {task.id: TaskRun(task, run_id, scopes[task.id], started_at, MemorySnapshot()) for task in tasks}
+        invocation_scopes = (
+            tuple(scopes[source.task.id] for source in runtime.sources for _ in source.runtime_steps) if runtime else ()
+        )
+        job_config = _job_config(
+            tasks[0],
+            run_id,
+            scopes[tasks[0].id],
+            output_dir,
+            settings,
+            runtime=runtime,
+            invocation_scopes=invocation_scopes,
+        )
         try:
-            memory_tasks = tuple(task for task in tasks if isinstance(task.evaluation, MemoryEvaluationSpec))
-            if memory_tasks:
-                await client.get_readiness()
             for task in memory_tasks:
                 run = runs[task.id]
                 runs[task.id] = run._replace(memory_before=await memory_snapshot(client, run.scope_id))
@@ -649,11 +661,19 @@ async def _prepared_probes(
 ) -> tuple[RecallProbeObservation, ...]:
     probes = []
     for probe in evaluation.probes:
+        context = await prepared_context(client, scope_id, probe.query)
+        forbidden_context_matched = context.status == "ready" and matches_forbidden_context(
+            context.content,
+            probe.forbidden_context,
+        )
+        if forbidden_context_matched:
+            context = context.model_copy(update={"content": ""})
         probes.append(
             RecallProbeObservation(
                 id=probe.id,
                 query=probe.query,
-                prepared_context=await prepared_context(client, scope_id, probe.query),
+                prepared_context=context,
+                forbidden_context_matched=forbidden_context_matched,
             )
         )
     return tuple(probes)

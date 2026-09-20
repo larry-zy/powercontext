@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import struct
 from collections.abc import Mapping
+from re import search
 from typing import Any
 
 from sqlalchemy import (
@@ -28,6 +29,7 @@ from sqlalchemy import (
     Integer,
     Table,
     UniqueConstraint,
+    bindparam,
     delete,
     func,
     insert,
@@ -59,6 +61,7 @@ from powercontext.builtin.persistence.tables import (
     SHARED_METADATA,
     identity_string,
 )
+from powercontext.builtin.persistence.tags import memory_tag_parameters, memory_tag_sql
 from powercontext.limits import MAX_ARTIFACT_ID_LENGTH, MAX_SCOPE_ID_LENGTH
 
 SQLITE_MEMORY_FTS_MARKER_TABLE = Table(
@@ -150,9 +153,51 @@ _INSERT_FTS_SQL = text(
     )
     """
 )
+_TAGGED_FTS_SQL = text(str(_SEARCH_FTS_SQL).replace("ORDER BY", memory_tag_sql("f") + "ORDER BY")).bindparams(
+    bindparam("tag_keys", expanding=True),
+    bindparam("tag_hashes", expanding=True),
+)
 _DELETE_VECTOR_SQL = text("DELETE FROM pc_memory_entry_vec WHERE rowid = :vector_id")
+_DELETE_ORPHAN_VECTORS_SQL = (
+    "DELETE FROM pc_memory_entry_vec WHERE rowid NOT IN (SELECT vector_id FROM pc_memory_vector_entries)"
+)
 _INSERT_VECTOR_SQL = text("INSERT INTO pc_memory_entry_vec (rowid, embedding) VALUES (:vector_id, :embedding)")
 _SELECT_VECTOR_SQL = text("SELECT embedding FROM pc_memory_entry_vec WHERE rowid = :vector_id")
+_VECTOR_COMPLETENESS_SQL = text(
+    """
+    WITH requested AS (
+        SELECT CAST(json_extract(value, '$.artifact_id') AS TEXT) AS memory_artifact_id,
+               CAST(json_extract(value, '$.revision') AS INTEGER) AS head_revision
+        FROM json_each(:memory_refs)
+    )
+    SELECT 'head' AS row_kind, h.memory_artifact_id, h.head_revision,
+           h.entry_id, h.entry_version_id, h.entry_content_hash,
+           NULL AS embedding_content_hash, NULL AS vector_present
+    FROM pc_memory_entry_heads AS h
+    JOIN requested AS r
+      ON r.memory_artifact_id = h.memory_artifact_id
+     AND r.head_revision = h.head_revision
+    WHERE h.scope_id = :scope_id
+    UNION ALL
+    SELECT 'artifact_head' AS row_kind, h.artifact_id, h.revision,
+           NULL AS entry_id, NULL AS entry_version_id, NULL AS entry_content_hash,
+           NULL AS embedding_content_hash, NULL AS vector_present
+    FROM pc_artifact_heads AS h
+    JOIN requested AS r ON r.memory_artifact_id = h.artifact_id
+    WHERE h.scope_id = :scope_id
+      AND h.family = 'memory'
+    UNION ALL
+    SELECT 'vector' AS row_kind, m.memory_artifact_id, m.head_revision,
+           m.entry_id, m.entry_version_id, m.entry_content_hash,
+           m.embedding_content_hash,
+           CASE WHEN v.rowid IS NULL THEN 0 ELSE 1 END AS vector_present
+    FROM pc_memory_vector_entries AS m
+    JOIN requested AS r
+      ON r.memory_artifact_id = m.memory_artifact_id
+    LEFT JOIN pc_memory_entry_vec AS v ON v.rowid = m.vector_id
+    WHERE m.scope_id = :scope_id
+    """
+)
 _VECTOR_SEARCH_SQL = text(
     """
     WITH nearest AS (
@@ -177,11 +222,31 @@ _VECTOR_SEARCH_SQL = text(
     """
 )
 
+# Exact distance evaluation over the eligible set avoids global KNN followed by
+# post-filtering. The unfiltered path keeps its existing behavior.
+_TAGGED_VECTOR_SEARCH_SQL = text(
+    """
+    SELECT m.memory_artifact_id, m.head_revision, m.entry_id, m.entry_version_id, v.text,
+           vec_distance_L2(vec.embedding, :query_vector) AS distance
+    FROM pc_memory_vector_entries AS m
+    JOIN pc_memory_entry_vec AS vec ON vec.rowid = m.vector_id
+    JOIN pc_memory_entry_versions AS v
+      ON v.scope_id = m.scope_id
+     AND v.memory_artifact_id = m.memory_artifact_id
+     AND v.entry_version_id = m.entry_version_id
+    WHERE m.scope_id = :scope_id
+      AND m.memory_artifact_id IN (SELECT value FROM json_each(:memory_artifact_ids))
+    /* tag-filter */
+    ORDER BY distance, m.memory_artifact_id, m.entry_id, m.entry_version_id
+    LIMIT :candidate_limit
+""".replace("/* tag-filter */", memory_tag_sql("m"))
+).bindparams(bindparam("tag_keys", expanding=True), bindparam("tag_hashes", expanding=True))
+
 
 class SQLiteMemoryFTSIndex:
     """SQLite FTS5 strategy over rebuildable active-head projections."""
 
-    capabilities = MemoryCapabilities(fts=True)
+    capabilities = MemoryCapabilities(fts=True, tag_filter=True)
     tables: tuple[Table, ...] = SQLITE_MEMORY_FTS_TABLES
 
     async def initialize(self, connection: AsyncConnection, /) -> None:
@@ -249,7 +314,7 @@ class SQLiteMemoryFTSIndex:
             return MemorySearchChannels()
         rows = (
             await connection.execute(
-                _SEARCH_FTS_SQL,
+                _SEARCH_FTS_SQL if request.tag_filter is None else _TAGGED_FTS_SQL,
                 {
                     "query": query,
                     "scope_id": scope_id,
@@ -258,6 +323,7 @@ class SQLiteMemoryFTSIndex:
                         separators=(",", ":"),
                     ),
                     "candidate_limit": request.candidate_limit,
+                    **memory_tag_parameters(request.tag_filter),
                 },
             )
         ).mappings()
@@ -315,7 +381,7 @@ class SQLiteMemoryVectorIndex:
                 "sqlite-vec requires a positive unit-normalized L2 embedding profile",
             )
         self.profile = profile
-        self.capabilities = MemoryCapabilities(vector=True, embedding_profile=profile, fts=False)
+        self.capabilities = MemoryCapabilities(vector=True, embedding_profile=profile, fts=False, tag_filter=True)
 
     async def initialize(self, connection: AsyncConnection, /) -> None:
         if connection.dialect.name != "sqlite":
@@ -327,6 +393,9 @@ class SQLiteMemoryVectorIndex:
                 f"USING vec0(embedding float[{self.profile.dimension}])"
             )
             probe = _pack_vector((0.0,) * self.profile.dimension)
+            # A previous run may have been interrupted between inserting and deleting
+            # the probe row; clear any leftover before probing again.
+            await connection.execute(_DELETE_VECTOR_SQL, {"vector_id": -1})
             await connection.execute(
                 _INSERT_VECTOR_SQL,
                 {"vector_id": -1, "embedding": probe},
@@ -339,9 +408,13 @@ class SQLiteMemoryVectorIndex:
             ).one_or_none()
             await connection.execute(_DELETE_VECTOR_SQL, {"vector_id": -1})
         except SQLAlchemyError as error:
-            raise CapabilityNotSupportedError("vector", "sqlite-vec probe failed") from error
+            detail = await _probe_failure_detail(connection, error, self.profile.dimension)
+            raise CapabilityNotSupportedError("vector", detail) from error
         if row is None or int(row[0]) != -1:
             raise CapabilityNotSupportedError("vector", "sqlite-vec probe returned an invalid row")
+        # Embeddings are only reachable through their metadata rows. Drop any that
+        # lost theirs, so stale neighbors cannot take the place of live entries.
+        await connection.exec_driver_sql(_DELETE_ORPHAN_VECTORS_SQL)
 
     async def replace(
         self,
@@ -372,21 +445,19 @@ class SQLiteMemoryVectorIndex:
                 continue
             vector = validate_embedding(projection.embedding, dimension=self.profile.dimension)
             entry = projection.entry_version
-            vector_id = (
-                await connection.execute(
-                    insert(SQLITE_MEMORY_VECTOR_ENTRIES_TABLE)
-                    .values(
-                        scope_id=scope_id,
-                        memory_artifact_id=memory_ref.artifact_id,
-                        head_revision=memory_ref.revision,
-                        entry_id=entry.entry_id,
-                        entry_version_id=entry.entry_version_id,
-                        entry_content_hash=entry.entry_content_hash,
-                        embedding_content_hash=projection.embedding_content_hash,
-                    )
-                    .returning(SQLITE_MEMORY_VECTOR_ENTRIES_TABLE.c.vector_id)
+            inserted = await connection.execute(
+                insert(SQLITE_MEMORY_VECTOR_ENTRIES_TABLE).values(
+                    scope_id=scope_id,
+                    memory_artifact_id=memory_ref.artifact_id,
+                    head_revision=memory_ref.revision,
+                    entry_id=entry.entry_id,
+                    entry_version_id=entry.entry_version_id,
+                    entry_content_hash=entry.entry_content_hash,
+                    embedding_content_hash=projection.embedding_content_hash,
                 )
-            ).scalar_one()
+            )
+            # SQLite before 3.35 supports lastrowid, but not INSERT ... RETURNING.
+            vector_id = inserted.lastrowid
             await connection.execute(
                 _INSERT_VECTOR_SQL,
                 {"vector_id": vector_id, "embedding": _pack_vector(vector)},
@@ -411,10 +482,11 @@ class SQLiteMemoryVectorIndex:
             return MemorySearchChannels()
         rows = (
             await connection.execute(
-                _VECTOR_SEARCH_SQL,
+                _VECTOR_SEARCH_SQL if request.tag_filter is None else _TAGGED_VECTOR_SEARCH_SQL,
                 {
                     "query_vector": query_vector,
                     "neighbor_limit": total,
+                    **memory_tag_parameters(request.tag_filter),
                     "scope_id": scope_id,
                     "memory_artifact_ids": json.dumps(
                         tuple(ref.artifact_id for ref in request.memories),
@@ -436,44 +508,36 @@ class SQLiteMemoryVectorIndex:
     ) -> bool:
         if profile != self.profile:
             return False
-        for memory in memories:
-            heads = (
-                await connection.execute(
-                    select(
-                        MEMORY_ENTRY_HEADS_TABLE.c.entry_id,
-                        MEMORY_ENTRY_HEADS_TABLE.c.entry_version_id,
-                        MEMORY_ENTRY_HEADS_TABLE.c.entry_content_hash,
-                    ).where(
-                        MEMORY_ENTRY_HEADS_TABLE.c.scope_id == scope_id,
-                        MEMORY_ENTRY_HEADS_TABLE.c.memory_artifact_id == memory.artifact_id,
-                        MEMORY_ENTRY_HEADS_TABLE.c.head_revision == memory.revision,
-                    )
-                )
-            ).all()
-            metadata = (
-                await connection.execute(
-                    select(
-                        SQLITE_MEMORY_VECTOR_ENTRIES_TABLE.c.vector_id,
-                        SQLITE_MEMORY_VECTOR_ENTRIES_TABLE.c.entry_id,
-                        SQLITE_MEMORY_VECTOR_ENTRIES_TABLE.c.entry_version_id,
-                        SQLITE_MEMORY_VECTOR_ENTRIES_TABLE.c.entry_content_hash,
-                        SQLITE_MEMORY_VECTOR_ENTRIES_TABLE.c.embedding_content_hash,
-                    ).where(
-                        SQLITE_MEMORY_VECTOR_ENTRIES_TABLE.c.scope_id == scope_id,
-                        SQLITE_MEMORY_VECTOR_ENTRIES_TABLE.c.memory_artifact_id == memory.artifact_id,
-                        SQLITE_MEMORY_VECTOR_ENTRIES_TABLE.c.head_revision == memory.revision,
-                    )
-                )
-            ).all()
-            expected = {(str(row[0]), str(row[1]), str(row[2])) for row in heads}
-            actual = {(str(row[1]), str(row[2]), str(row[3])) for row in metadata}
-            if actual != expected:
+        rows = (
+            await connection.execute(
+                _VECTOR_COMPLETENESS_SQL,
+                {
+                    "scope_id": scope_id,
+                    "memory_refs": json.dumps(
+                        tuple({"artifact_id": memory.artifact_id, "revision": memory.revision} for memory in memories),
+                        separators=(",", ":"),
+                    ),
+                },
+            )
+        ).all()
+        current_revisions = {str(row[1]): int(row[2]) for row in rows if str(row[0]) == "artifact_head"}
+        if any(current_revisions.get(memory.artifact_id) != memory.revision for memory in memories):
+            # The caller validated this head before the search. If it moved while
+            # this query ran, report a stale head so the runtime can retry with it.
+            raise CapabilityNotSupportedError("head")
+        expected = {
+            (str(row[1]), int(row[2]), str(row[3]), str(row[4]), str(row[5])) for row in rows if str(row[0]) == "head"
+        }
+        actual = {
+            (str(row[1]), int(row[2]), str(row[3]), str(row[4]), str(row[5])) for row in rows if str(row[0]) == "vector"
+        }
+        if actual != expected:
+            return False
+        for row in rows:
+            if str(row[0]) != "vector":
+                continue
+            if str(row[6]) != _embedding_hash(self.profile, str(row[5])) or not bool(row[7]):
                 return False
-            for row in metadata:
-                if str(row[4]) != _embedding_hash(self.profile, str(row[3])):
-                    return False
-                if (await connection.execute(_SELECT_VECTOR_SQL, {"vector_id": int(row[0])})).one_or_none() is None:
-                    return False
         return True
 
     async def hydrate(
@@ -523,6 +587,36 @@ class SQLiteMemoryVectorIndex:
                 )
             )
         return tuple(hydrated)
+
+
+async def _probe_failure_detail(connection: AsyncConnection, error: SQLAlchemyError, dimension: int) -> str:
+    orig = getattr(error, "orig", None)
+    detail = str(orig) if orig is not None else str(error)
+    existing = await _existing_vec_dimension(connection)
+    if existing is not None and existing != dimension:
+        return (
+            "sqlite-vec probe failed: the existing pc_memory_entry_vec table dimension "
+            f"{existing} does not match the configured embedding profile dimension {dimension}; "
+            f"migrate the table or align the embedding dimension configuration ({detail})"
+        )
+    return f"sqlite-vec probe failed: {detail}"
+
+
+async def _existing_vec_dimension(connection: AsyncConnection) -> int | None:
+    """Return the dimension of a pre-existing vec0 table, or None when it cannot be confirmed."""
+
+    try:
+        row = (
+            await connection.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pc_memory_entry_vec'"
+            )
+        ).one_or_none()
+    except SQLAlchemyError:
+        return None
+    if row is None:
+        return None
+    match = search(r"float\[(\d+)\]", str(row[0]))
+    return int(match.group(1)) if match is not None else None
 
 
 def _pack_vector(vector: tuple[float, ...]) -> bytes:
