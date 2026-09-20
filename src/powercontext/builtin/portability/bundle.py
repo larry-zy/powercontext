@@ -139,15 +139,9 @@ ProgressObserver = Callable[["BundleProgress"], None]
 class BundleFormatError(ValueError):
     """The supplied archive is malformed, corrupt, or unsupported."""
 
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-
 
 class BundleConflictError(ValueError):
     """A target immutable identity exists with different canonical content."""
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,11 +200,6 @@ class _Record:
     identity: Mapping[str, str | int]
     payload: Mapping[str, Any]
     digest: str
-
-
-@dataclass(frozen=True, slots=True)
-class _ParsedBundle:
-    inspection: BundleInspection
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,7 +436,7 @@ class PortableBundleService:
     async def inspect(source: Path, /, *, progress: ProgressObserver | None = None) -> BundleInspection:
         """Verify structure and checksums without touching the target database."""
 
-        return _parse_bundle(source, progress=progress, phase="inspect").inspection
+        return _parse_bundle(source, progress=progress, phase="inspect")
 
     async def validate(
         self,
@@ -459,7 +448,7 @@ class PortableBundleService:
     ) -> BundleValidation:
         """Verify bundle integrity, dependencies, and optional adapter support."""
 
-        parsed = _parse_bundle(source, progress=progress, phase="validate")
+        inspection = _parse_bundle(source, progress=progress, phase="validate")
         _validate_dependencies(source)
         required_sources = {
             str(record.identity["source_type"]) for record in _iter_records(source) if record.record_type == "source"
@@ -475,16 +464,16 @@ class PortableBundleService:
             else tuple(sorted(required_families - self._supported_artifact_families))
         )
         already_present, conflicts = await self._target_compatibility(
-            source, total=parsed.inspection.record_count, progress=progress
+            source, total=inspection.record_count, progress=progress
         )
         return BundleValidation(
-            bundle_id=parsed.inspection.bundle_id,
-            scopes=parsed.inspection.scopes,
-            record_count=parsed.inspection.record_count,
-            records_by_type=parsed.inspection.records_by_type,
-            total_digest=parsed.inspection.total_digest,
-            format_version=parsed.inspection.format_version,
-            producer_version=parsed.inspection.producer_version,
+            bundle_id=inspection.bundle_id,
+            scopes=inspection.scopes,
+            record_count=inspection.record_count,
+            records_by_type=inspection.records_by_type,
+            total_digest=inspection.total_digest,
+            format_version=inspection.format_version,
+            producer_version=inspection.producer_version,
             already_present=already_present,
             conflicts=conflicts,
             projections_supported=self._projection_rebuilder is not None,
@@ -524,7 +513,6 @@ class PortableBundleService:
     async def _restore_snapshot(
         self, source: Path, /, *, supported_source_types: Iterable[str] | None, progress: ProgressObserver | None
     ) -> BundleReceipt:
-        parsed = _parse_bundle(source)
         validation = await self.validate(source, supported_source_types=supported_source_types, progress=progress)
         if validation.conflicts:
             raise BundleConflictError(f"target contains {validation.conflicts} conflicting record identities")
@@ -534,11 +522,11 @@ class PortableBundleService:
             with _staged_records(source) as staged:
                 async with self._database.transaction() as connection:
                     inserted, existing = await self._write_records(
-                        connection, staged, total=parsed.inspection.record_count, progress=progress
+                        connection, staged, total=validation.record_count, progress=progress
                     )
                     await self._write_restore_receipt(
                         connection,
-                        parsed.inspection,
+                        validation,
                         inserted=inserted,
                         already_present=existing,
                         projections_ready=False,
@@ -548,21 +536,21 @@ class PortableBundleService:
         projections_ready = False
         if self._projection_rebuilder is not None:
             _report_progress(progress, "projections", 0, 1)
-            await self._projection_rebuilder(parsed.inspection.scopes)
+            await self._projection_rebuilder(validation.scopes)
             projections_ready = True
             _report_progress(progress, "projections", 1, 1)
             async with self._database.transaction() as connection:
                 await self._write_restore_receipt(
                     connection,
-                    parsed.inspection,
+                    validation,
                     inserted=inserted,
                     already_present=existing,
                     projections_ready=True,
                 )
         return BundleReceipt(
-            bundle_id=parsed.inspection.bundle_id,
-            record_count=parsed.inspection.record_count,
-            total_digest=parsed.inspection.total_digest,
+            bundle_id=validation.bundle_id,
+            record_count=validation.record_count,
+            total_digest=validation.total_digest,
             inserted=inserted,
             already_present=existing,
             projections_ready=projections_ready,
@@ -667,9 +655,9 @@ class PortableBundleService:
         existing = 0
         processed = 0
         for record in _ordered_scope_records(_staged_type_records(staged, "scope")):
-            was_inserted = await self._write_record(connection, record)
-            inserted += int(was_inserted)
-            existing += int(not was_inserted)
+            added, skipped = await self._write_batch(connection, "scope", (record,))
+            inserted += added
+            existing += skipped
             processed += 1
             _report_progress(progress, "restore", processed, total)
         # The disk index was built before acquiring the target write transaction.
@@ -713,18 +701,6 @@ class PortableBundleService:
         if values:
             await connection.execute(insert(spec.table), values)
         return len(values), len(records) - len(values)
-
-    async def _write_record(self, connection: AsyncConnection, record: _Record, /) -> bool:
-        table = _SPECS[record.record_type].table
-        where = [table.c[key] == _database_value(value, table.c[key]) for key, value in record.identity.items()]
-        row = (await connection.execute(select(table).where(*where))).mappings().one_or_none()
-        if row is not None:
-            present = _record_from_row(record.record_type, cast(Mapping[str, Any], dict(row)))
-            if present.digest != record.digest:
-                raise BundleConflictError(f"immutable identity conflict: {record.record_type}")
-            return False
-        await connection.execute(insert(table).values(**_row_values(record)))
-        return True
 
     async def _stream_export(
         self,
@@ -840,7 +816,7 @@ def _parse_bundle(
     *,
     progress: ProgressObserver | None = None,
     phase: Literal["inspect", "validate"] = "inspect",
-) -> _ParsedBundle:
+) -> BundleInspection:
     try:
         with zipfile.ZipFile(source) as archive:
             _validate_container(archive)
@@ -852,7 +828,10 @@ def _parse_bundle(
     count = 0
     counts: Counter[str] = Counter()
     digest = _DigestAccumulator()
+    scope_ids: list[str] = []
     for record in _iter_records(source):
+        if record.record_type == "scope":
+            scope_ids.append(str(record.identity["scope_id"]))
         count += 1
         counts[record.record_type] += 1
         digest.add(record.digest)
@@ -874,12 +853,9 @@ def _parse_bundle(
         format_version=manifest["format_version"],
         producer_version=manifest["producer"]["version"],
     )
-    scope_ids = tuple(
-        str(record.identity["scope_id"]) for record in _iter_records(source) if record.record_type == "scope"
-    )
     if tuple(sorted(scope_ids)) != inspection.scopes:
         raise BundleFormatError("manifest scopes do not match scope records")
-    return _ParsedBundle(inspection=inspection)
+    return inspection
 
 
 @contextmanager
@@ -1506,7 +1482,7 @@ def _validate_record_dependencies(  # noqa: C901 - logical record kinds have dis
             },
         ):
             raise BundleFormatError("candidate head references missing result revision")
-    _validate_embedded_references((record,), contains)
+    _validate_embedded_references(record, contains)
     _validate_memory_citations(record, contains)
 
 
@@ -1538,7 +1514,8 @@ def _validate_source_journal_records(source: Path, /) -> None:
             raise BundleFormatError("source journal snapshot is inconsistent")
 
 
-def _validate_skill_package_contents(source: Path, /) -> None:
+def _validated_skill_packages(source: Path, /) -> dict[tuple[str, str], tuple[str, int, int, int]]:
+    packages: dict[tuple[str, str], tuple[str, int, int, int]] = {}
     for record in _iter_records(source):
         if record.record_type != "skill_package":
             continue
@@ -1557,20 +1534,17 @@ def _validate_skill_package_contents(source: Path, /) -> None:
             record.payload["manifest"]
         ):
             raise BundleFormatError("Skill package bytes do not match metadata")
+        packages[(str(record.identity["scope_id"]), str(record.identity["tree_digest"]))] = (
+            snapshot.reference.archive_digest,
+            snapshot.reference.file_count,
+            snapshot.reference.uncompressed_size,
+            snapshot.reference.archive_size,
+        )
+    return packages
 
 
 def _validate_skill_package_dependencies(source: Path, /) -> None:
-    _validate_skill_package_contents(source)
-    packages = {
-        (str(record.identity["scope_id"]), str(record.identity["tree_digest"])): (
-            str(record.payload["archive_digest"]),
-            int(record.payload["file_count"]),
-            int(record.payload["uncompressed_size"]),
-            int(record.payload["archive_size"]),
-        )
-        for record in _iter_records(source)
-        if record.record_type == "skill_package"
-    }
+    packages = _validated_skill_packages(source)
     for record in _iter_records(source):
         if record.record_type == "artifact_revision" and record.identity["family"] == "skill":
             content = _decoded_bytes_json(record.payload["content"], "Skill content")
@@ -1664,34 +1638,33 @@ def _identity_index(source: Path, /) -> Iterator[Callable[[str, Mapping[str, obj
 
 
 def _validate_embedded_references(
-    records: Iterable[_Record],
+    record: _Record,
     contains: Callable[[str, Mapping[str, object]], bool],
 ) -> None:
-    for record in records:
-        if record.record_type not in {"memory_entry_version", "candidate_version"}:
-            continue
-        scope_id = record.identity["scope_id"]
-        for reference in _reference_items(record.payload["source_refs"], "source"):
-            if not contains(
-                "source",
-                {
-                    "scope_id": scope_id,
-                    "source_type": reference["source_type"],
-                    "source_id": reference["source_id"],
-                },
-            ):
-                raise BundleFormatError("record references missing source")
-        for reference in _reference_items(record.payload["artifact_refs"], "artifact"):
-            if not contains(
-                "artifact_revision",
-                {
-                    "scope_id": scope_id,
-                    "family": reference["family"],
-                    "artifact_id": reference["artifact_id"],
-                    "revision": reference["revision"],
-                },
-            ):
-                raise BundleFormatError("record references missing artifact revision")
+    if record.record_type not in {"memory_entry_version", "candidate_version"}:
+        return
+    scope_id = record.identity["scope_id"]
+    for reference in _reference_items(record.payload["source_refs"], "source"):
+        if not contains(
+            "source",
+            {
+                "scope_id": scope_id,
+                "source_type": reference["source_type"],
+                "source_id": reference["source_id"],
+            },
+        ):
+            raise BundleFormatError("record references missing source")
+    for reference in _reference_items(record.payload["artifact_refs"], "artifact"):
+        if not contains(
+            "artifact_revision",
+            {
+                "scope_id": scope_id,
+                "family": reference["family"],
+                "artifact_id": reference["artifact_id"],
+                "revision": reference["revision"],
+            },
+        ):
+            raise BundleFormatError("record references missing artifact revision")
 
 
 def _reference_items(value: object, kind: Literal["source", "artifact"], /) -> tuple[Mapping[str, object], ...]:

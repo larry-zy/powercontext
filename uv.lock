@@ -1202,7 +1202,7 @@ name = "importlib-metadata"
 version = "9.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "zipp", marker = "python_full_version < '3.12'" },
+    { name = "zipp" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a9/01/15bb152d77b21318514a96f43af312635eb2500c96b55398d020c93d86ea/importlib_metadata-9.0.0.tar.gz", hash = "sha256:a4f57ab599e6a2e3016d7595cfd72eb4661a5106e787a95bcc90c7105b831efc", size = 56405, upload-time = "2026-03-20T06:42:56.999Z" }
 wheels = [
@@ -2369,8 +2369,8 @@ name = "opendalfs"
 version = "0.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "fsspec", marker = "python_full_version >= '3.12'" },
-    { name = "opendal", marker = "python_full_version >= '3.12'" },
+    { name = "fsspec" },
+    { name = "opendal" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/0d/23/fdb4d34f08ac68a27b2d553256e13b15ce139916d36bab33f9a0e71e8770/opendalfs-0.1.0.tar.gz", hash = "sha256:5ceaeccc0852ef10c8ef2ce20e5927dbc18083909c06550ad36f81bcacb5774d", size = 75112, upload-time = "2026-08-26T05:30:33.497Z" }
 wheels = [
@@ -2911,8 +2911,8 @@ name = "powercontext-connector-opendal"
 version = "0.0.1"
 source = { editable = "integrations/opendal" }
 dependencies = [
-    { name = "opendalfs", marker = "python_full_version >= '3.12'" },
-    { name = "powercontext", extra = ["client"], marker = "python_full_version >= '3.12'" },
+    { name = "opendalfs" },
+    { name = "powercontext", extra = ["client"] },
 ]
 
 [package.metadata]

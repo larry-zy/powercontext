@@ -104,8 +104,7 @@ run_scan() {
 
 sanitize_detector() {
     local value="$1"
-    local lower_value
-    lower_value="$(printf '%s' "${value}" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+    local lower_value="${value,,}"
     if test "${#value}" -le 120; then
         case "${value}" in
             ""|[!A-Za-z0-9]*) ;;

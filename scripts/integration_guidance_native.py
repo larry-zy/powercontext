@@ -58,21 +58,9 @@ class NativeHandoffSession:
             if node is None:
                 message = "Native guidance evaluation requires Node.js 22.19+ and installed host dependencies"
                 raise RuntimeError(message)
-            probe = await asyncio.create_subprocess_exec(
-                node,
-                "-p",
-                'process.allowedNodeEnvironmentFlags.has("--experimental-transform-types")',
-                stdout=asyncio.subprocess.PIPE,
-            )
-            flags, _ = await probe.communicate()
-            if probe.returncode:
-                message = "Could not inspect native guidance Node.js capabilities"
-                raise RuntimeError(message)
-            # Newer Node releases remove the flag after enabling TypeScript by default.
-            transform_flags = ("--experimental-transform-types",) if flags.strip() == b"true" else ()
             self.process = await asyncio.create_subprocess_exec(
                 node,
-                *transform_flags,
+                "--experimental-transform-types",
                 str(Path(__file__).with_suffix(".mjs")),
                 self.host,
                 stdin=asyncio.subprocess.PIPE,
