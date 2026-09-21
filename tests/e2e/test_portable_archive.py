@@ -17,15 +17,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import importlib.util
+import json
 import os
+import zipfile
+from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.engine import make_url
 
 from powercontext.artifacts import ArtifactRef
@@ -35,8 +40,9 @@ from powercontext.builtin.inference import EmbeddingResult
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
 from powercontext.builtin.persistence.seekdb import SeekDBConfig
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
+from powercontext.builtin.persistence.tables import SCOPES_TABLE, SOURCE_JOURNAL_HEADS_TABLE, SOURCES_TABLE
 from powercontext.builtin.persistence.topic_memory import TopicMemoryStorageInvariantError
-from powercontext.builtin.portability import PortableBundleService
+from powercontext.builtin.portability import BundleConflictError, BundleFormatError, PortableBundleService
 from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.runtime import (
     BuiltinConfig,
@@ -45,12 +51,22 @@ from powercontext.builtin.runtime import (
     HandoffSourceCitation,
     HandoffStatement,
     RememberMemoryRequest,
+    SubmitSourceObservation,
     open_builtin_contexts,
     open_builtin_runtime,
 )
 from powercontext.builtin.scope import ScopeDraft
+from powercontext.builtin.sources import ContentCapture
 from powercontext.builtin.tags import MemoryEntryTagTarget, TagFilter
 from powercontext.builtin.work import AcknowledgeHandoff, ReceiverChecks
+from powercontext.sources import (
+    AdapterSourceDefinition,
+    SourceDefinitionRegistry,
+    SourceRef,
+    manifest_for_definition,
+    project_source_for_transport,
+)
+from tests.builtin.persistence.contract import NoteAdapter, NoteInput, NoteSource
 
 
 def test_topic_restore_can_retry_after_projection_failure_and_restart(tmp_path: Path) -> None:
@@ -339,3 +355,231 @@ def target_config(tmp_path: Path, short_tmp_path: Path, request: pytest.FixtureR
             engine.dispose()
     else:
         yield BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'target.db'}"))
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("target_definition", ["absent", "identical", "conflicting"])
+def test_archive_preserves_remote_observations_without_worker_adapter(
+    tmp_path: Path, legacy: bool, target_definition: str
+) -> None:
+
+    async def scenario() -> None:
+        definition = AdapterSourceDefinition(NoteAdapter())
+        registry = SourceDefinitionRegistry((definition,))
+        manifest = manifest_for_definition(definition)
+        observation = project_source_for_transport(
+            registry, await registry.resolve(NoteInput(note_id="one", body="remote"))
+        )
+        archive = tmp_path / "remote.pcb"
+
+        async def authorize(_scopes: tuple[str, ...]) -> None:
+            pass
+
+        async with open_builtin_contexts(BuiltinConfig()) as source:
+            scope = await source.scopes.create(
+                ScopeDraft(title="Remote", summary="Remote sources", idempotency_key="remote")
+            )
+            await source.register_source_definition(manifest)
+
+            class UnrelatedAdapter(NoteAdapter):
+                name = "unrelated-note"
+
+            await source.register_source_definition(
+                manifest_for_definition(AdapterSourceDefinition(UnrelatedAdapter()))
+            )
+            await source.submit_source_observation(
+                SubmitSourceObservation(scope_id=scope.scope_id, observation=observation)
+            )
+            if legacy:
+                async with source.database.transaction() as connection:
+                    await connection.execute(
+                        update(SOURCES_TABLE).values(payload=observation.model_dump_json().encode())
+                    )
+            await source.portability.export([scope.scope_id], archive, authorize=authorize)
+            assert (await source.portability.inspect(archive)).records_by_type["source_definition"] == 1
+        target_config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'remote.db'}"))
+        async with open_builtin_contexts(target_config) as target:
+            if target_definition == "identical":
+                await target.register_source_definition(manifest)
+            elif target_definition == "conflicting":
+
+                class DifferentNoteSource(NoteSource):
+                    category: str = "changed"
+
+                class DifferentNoteAdapter(NoteAdapter):
+                    source_class = DifferentNoteSource
+
+                await target.register_source_definition(
+                    manifest_for_definition(AdapterSourceDefinition(DifferentNoteAdapter()))
+                )
+            validation = await target.portability.validate(archive)
+            if target_definition == "conflicting":
+                assert not validation.compatible
+                assert validation.conflicts == 1
+                with pytest.raises(BundleConflictError):
+                    await target.portability.restore(archive)
+                async with target.database.transaction() as connection:
+                    assert (
+                        await connection.scalar(
+                            select(SCOPES_TABLE.c.scope_id).where(SCOPES_TABLE.c.scope_id == scope.scope_id)
+                        )
+                        is None
+                    )
+                return
+            assert validation.compatible
+            assert validation.unsupported_source_types == ()
+            assert (await target.portability.restore(archive)).projections_ready
+        async with open_builtin_contexts(target_config) as target:
+            async with target.database.transaction() as connection:
+                stored = await target.repositories.sources.get(
+                    connection,
+                    scope.scope_id,
+                    SourceRef(source_type=observation.source_type, source_id=observation.name),
+                )
+                assert stored.value == observation
+                assert (
+                    await target.repositories.source_definitions.get(connection, manifest.name, manifest.version)
+                    == manifest
+                )
+            # Continuing ingestion must also work without registering the manifest again.
+            assert (
+                await target.submit_source_observation(
+                    SubmitSourceObservation(scope_id=scope.scope_id, observation=observation)
+                )
+            ).sequence == 1
+
+    asyncio.run(scenario())
+
+
+def test_archive_snapshot_survives_concurrent_mysql_capture(tmp_path: Path, target_config: BuiltinConfig) -> None:
+
+    if target_config.database.kind == "sqlite":
+        pytest.skip("SQLite snapshot has a separate concurrent-writer regression")
+
+    async def scenario() -> None:
+        async with open_builtin_contexts(target_config) as source:
+            scope = await source.scopes.create(
+                ScopeDraft(title="Snapshot", summary="Concurrent writes", idempotency_key="snapshot")
+            )
+            context = await source.get(scope.scope_id)
+
+            await context.sources.capture(ContentCapture(source_id="before", content="before"))
+            async with source.database.transaction() as connection:
+                await connection.exec_driver_sql("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            captured = False
+
+            async def write_concurrently(_driver):
+                # A separate task owns a separate transaction/connection.
+                await asyncio.create_task(context.sources.capture(ContentCapture(source_id="after", content="after")))
+
+            def after_read(connection, _cursor, statement, _parameters, _context, _many):
+                nonlocal captured
+                if not captured and statement.startswith("SELECT pc_source_journal_heads."):
+                    captured = True
+                    connection.connection.dbapi_connection.run_async(write_concurrently)
+
+            async def authorize(_scopes: tuple[str, ...]) -> None:
+                pass
+
+            event.listen(source.database.engine.sync_engine, "after_cursor_execute", after_read)
+            try:
+                archive = tmp_path / "snapshot.pcb"
+                await source.portability.export([scope.scope_id], archive, authorize=authorize)
+            finally:
+                event.remove(source.database.engine.sync_engine, "after_cursor_execute", after_read)
+            assert captured
+        async with open_builtin_contexts(BuiltinConfig()) as target:
+            assert (await target.portability.validate(archive)).compatible
+            await target.portability.restore(archive)
+            async with target.database.transaction() as connection:
+                assert (
+                    await connection.scalar(
+                        select(SOURCE_JOURNAL_HEADS_TABLE.c.position).where(
+                            SOURCE_JOURNAL_HEADS_TABLE.c.scope_id == scope.scope_id
+                        )
+                    )
+                    == 1
+                )
+                assert (
+                    await connection.execute(
+                        select(SOURCES_TABLE.c.source_id).where(SOURCES_TABLE.c.scope_id == scope.scope_id)
+                    )
+                ).scalars().all() == ["before"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("damage", ["missing_definition", "fingerprint", "identity", "native"])
+def test_restore_rejects_invalid_remote_source_dependencies_before_writing(tmp_path: Path, damage: str) -> None:
+
+    async def scenario() -> None:
+        definition = AdapterSourceDefinition(NoteAdapter())
+        registry = SourceDefinitionRegistry((definition,))
+        observation = project_source_for_transport(
+            registry, await registry.resolve(NoteInput(note_id="one", body="remote"))
+        )
+        archive = tmp_path / "invalid.pcb"
+
+        async def authorize(_scopes: tuple[str, ...]) -> None:
+            pass
+
+        async with open_builtin_contexts(BuiltinConfig()) as source:
+            scope = await source.scopes.create(
+                ScopeDraft(title="Remote", summary="Dependencies", idempotency_key="remote")
+            )
+            await source.register_source_definition(manifest_for_definition(definition))
+            await source.submit_source_observation(
+                SubmitSourceObservation(scope_id=scope.scope_id, observation=observation)
+            )
+            await source.portability.export([scope.scope_id], archive, authorize=authorize)
+        with zipfile.ZipFile(archive) as bundle:
+            manifest = json.loads(bundle.read("manifest.json"))
+            records = [json.loads(line) for line in bundle.read("records.ndjson").splitlines()]
+        if damage == "missing_definition":
+            records = [record for record in records if record["record_type"] != "source_definition"]
+        else:
+            record = next(record for record in records if record["record_type"] == "source")
+            envelope = json.loads(base64.b64decode(record["payload"]["payload"]["base64"]))
+            if damage == "fingerprint":
+                envelope["value"]["definition_fingerprint"] = "sha256:" + "0" * 64
+            elif damage == "identity":
+                record["identity"]["source_id"] = "another"
+            else:
+                envelope["representation"] = "native"
+                envelope["value"] = envelope["value"]["payload"]
+            record["payload"]["payload"]["base64"] = base64.b64encode(json.dumps(envelope).encode()).decode()
+        for record in records:
+            record.pop("digest")
+            record["digest"] = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            )
+        manifest["record_count"] = len(records)
+        manifest["records_by_type"] = dict(Counter(record["record_type"] for record in records))
+        manifest["total_digest"] = (
+            "sha256:" + hashlib.sha256("\n".join(record["digest"] for record in records).encode()).hexdigest()
+        )
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("manifest.json", json.dumps(manifest))
+            bundle.writestr("records.ndjson", "\n".join(json.dumps(record) for record in records) + "\n")
+        async with open_builtin_contexts(BuiltinConfig()) as target:
+            if damage == "native":
+                validation = await target.portability.validate(archive)
+                assert not validation.compatible
+                assert validation.unsupported_source_types == ("note",)
+            else:
+                with pytest.raises(BundleFormatError):
+                    await target.portability.validate(archive)
+            with pytest.raises(BundleFormatError):
+                await target.portability.restore(archive)
+            async with target.database.transaction() as connection:
+                assert (
+                    await connection.scalar(
+                        select(SCOPES_TABLE.c.scope_id).where(SCOPES_TABLE.c.scope_id == scope.scope_id)
+                    )
+                    is None
+                )
+
+    asyncio.run(scenario())

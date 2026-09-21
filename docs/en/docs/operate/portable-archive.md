@@ -12,6 +12,8 @@ backup, an offline transfer, or a future backend migration.
 This is an offline operator command. It does not call a remote Server API. Without `--env-file` it opens the default
 SQLite database; with `--env-file` it uses the same SQLite, SeekDB, or OceanBase settings as that deployment. Stop
 PowerContext writers before restore. Export uses one database transaction as its consistent logical snapshot.
+MySQL-mode backends use `REPEATABLE READ` for the export transaction even when the deployment defaults to
+`READ COMMITTED`; later transactions retain the deployment default.
 
 ## Prerequisites
 
@@ -48,6 +50,8 @@ JSON on stderr while the final receipt remains JSON on stdout.
 `export` writes JSON containing the bundle ID, record count, and checksum. `inspect` verifies the ZIP structure,
 per-record digests, total digest, record counts, and selected scopes without opening the target database. Keep the
 reported checksum with the backup inventory if an external backup system needs an independent verification record.
+Before publishing the file, export checks its format, resource limits, and dependencies. If validation fails, an
+existing backup at the output path remains unchanged.
 
 ## Validate before a restore
 
@@ -63,6 +67,12 @@ configured Runtime can restore the archive's source types and Artifact families.
 reason; record bodies are not printed. A successful report includes
 `already_present`, `conflicts`, required and unsupported Source types and Artifact families, and whether the target has
 a projection rebuilder. Run against a different deployment with `--env-file ./target.env`.
+
+Native Sources require their Python adapter on the target. Worker-materialized `SourceObservation` records carry
+their captured payload and projections, so they can be read without loading that adapter. The bundle includes only
+the definition manifests referenced by the selected scopes and verifies observation identities and definition
+fingerprints before restore. Missing definitions and conflicting target definitions prevent restoration; unreferenced
+global definitions are not exported.
 
 To perform the write, repeat the command with explicit confirmation:
 
@@ -81,7 +91,7 @@ Format version 1 carries the portable relational representation of these support
 | Preserved | Not portable |
 | --- | --- |
 | Scope identity, hierarchy, context/external references, and creation identity | Scope access bindings and host-local default selection |
-| Source journal heads and Source records | Search projections and indexes |
+| Source journal heads, Source records, and referenced remote Source Definition manifests | Search projections and indexes |
 | Artifact Revisions, lineage, cross-Scope publication provenance, and heads | Source cursors and scheduler state |
 | Memory entry versions and heads | External Skill registrations and host-local installation state |
 | Candidate versions, decision heads, and their evidence references | Audit events, usage facts, evaluation receipts, and restore receipts |
@@ -132,8 +142,9 @@ the Server configuration guide. Dry-run must report no unsupported families and 
 
 ## Format compatibility
 
-Format version `1` readers accept version `1` bundles from any PowerContext producer version. The producer version is
-reported for diagnostics but does not replace the archive schema version. Writers produce only version `1`; there is no
+Format version `1` readers require support for every record type present in the bundle. Older readers may reject
+new record types even when the bundle uses format version `1`. The producer version is reported for diagnostics but
+does not replace the archive schema version or record-type compatibility checks. Writers produce only version `1`; there is no
 format `0` downgrade. A reader rejects unknown archive or record schema versions before target writes. Keep the old
 binary available until a restore drill succeeds when upgrading across a PowerContext major release.
 

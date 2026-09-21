@@ -614,7 +614,7 @@ def test_validate_rejects_an_artifact_family_the_target_runtime_cannot_restore(t
     asyncio.run(scenario())
 
 
-def test_validate_rejects_candidate_evidence_that_is_not_in_the_bundle(tmp_path: Path) -> None:
+def test_export_rejects_candidate_evidence_that_is_not_in_the_bundle(tmp_path: Path) -> None:
     async def scenario() -> None:
         archive = tmp_path / "scope.pcb"
         database = tmp_path / "source.db"
@@ -647,10 +647,12 @@ def test_validate_rejects_candidate_evidence_that_is_not_in_the_bundle(tmp_path:
                         status="pending",
                     )
                 )
-            await PortableBundleService(source.database).export(["project:one"], archive, authorize=_authorize_export)
-        async with SQLiteProfile.open(SQLiteConfig(), tables=BUILTIN_TABLES) as target:
+            archive.write_bytes(b"previous backup")
             with pytest.raises(BundleFormatError, match="missing source"):
-                await PortableBundleService(target.database).validate(archive)
+                await PortableBundleService(source.database).export(
+                    ["project:one"], archive, authorize=_authorize_export
+                )
+            assert archive.read_bytes() == b"previous backup"
 
     asyncio.run(scenario())
 
@@ -767,7 +769,7 @@ def test_bundle_preserves_registered_family_dependencies_and_tags(tmp_path: Path
     asyncio.run(scenario())
 
 
-def test_validation_rejects_package_backed_skill_without_its_package(tmp_path: Path) -> None:
+def test_export_rejects_package_backed_skill_without_its_package(tmp_path: Path) -> None:
     async def scenario() -> None:
         archive = tmp_path / "missing-package.pcb"
         content = json.dumps({
@@ -800,10 +802,12 @@ def test_validation_rejects_package_backed_skill_without_its_package(tmp_path: P
                         scope_id="project:one", family="skill", artifact_id="broken", revision=1
                     )
                 )
-            await PortableBundleService(source.database).export(["project:one"], archive, authorize=_authorize_export)
-        async with SQLiteProfile.open(SQLiteConfig(), tables=BUILTIN_TABLES) as target:
+            archive.write_bytes(b"previous backup")
             with pytest.raises(BundleFormatError, match="missing or mismatched package"):
-                await PortableBundleService(target.database).validate(archive)
+                await PortableBundleService(source.database).export(
+                    ["project:one"], archive, authorize=_authorize_export
+                )
+            assert archive.read_bytes() == b"previous backup"
 
     asyncio.run(scenario())
 

@@ -10,7 +10,8 @@ description: 创建、验证并恢复经过校验的 PowerContext 逻辑归档�
 
 这是一个离线运维命令，不调用远程 Server API。不传 `--env-file` 时打开默认 SQLite 数据库；传入后使用该部署的
 SQLite、SeekDB 或 OceanBase 配置。恢复前应停止 PowerContext 写入进程；导出使用一个数据库 transaction 获取一致的
-逻辑 snapshot。
+逻辑 snapshot。MySQL 模式的后端会为导出事务使用 `REPEATABLE READ`，即使部署默认采用
+`READ COMMITTED`；后续事务仍使用部署的默认隔离级别。
 
 ## 前提条件
 
@@ -44,6 +45,7 @@ powercontext archive inspect ./backups/payments.pcb
 
 `export` 会输出 JSON，其中包括 bundle ID、record 数和 checksum。`inspect` 不打开目标数据库，只校验 ZIP 结构、
 单 record digest、总 digest、record 数和所选 scope。若外部备份系统需要独立校验记录，请把输出的 checksum 一并保存。
+导出在发布文件前还会检查格式、资源限制和依赖完整性。验证失败时，输出路径上的旧备份保持不变。
 
 ## 在恢复前验证
 
@@ -54,9 +56,13 @@ powercontext archive restore ./backups/payments.pcb --dry-run
 ```
 
 dry-run 不会写入领域数据。它会校验 checksum、必需的 Source 和 Artifact 依赖，以及已配置 Runtime 是否支持归档中的
-source type 和 Artifact family。验证失败会以退出码 `2` 结束，只输出不含内容的原因，不会打印 record body。成功报告
+source type 和 Artifact family。归档无效时返回退出码 `2`，不兼容或目标冲突时返回 `3`；错误信息不打印 record body。成功报告
 包含 `already_present`、`conflicts`、所需和不支持的 Source type/Artifact family，以及目标是否支持 projection rebuild。
 可用 `--env-file ./target.env` 检查另一个部署。
+
+原生 Source 需要目标环境安装对应的 Python adapter。远程 worker 已物化的 `SourceObservation` 自带捕获内容和投影，
+读取时不需要加载该 adapter。归档只携带所选 scope 实际引用的 Source Definition manifest，并在恢复前校验 observation
+的身份和定义指纹。缺失定义或与目标定义冲突会阻止恢复；未引用的全局定义不会随包导出。
 
 要执行写恢复，必须显式确认：
 
@@ -75,7 +81,7 @@ powercontext archive restore ./backups/payments.pcb --yes
 | 会保留 | 不可移植 |
 | --- | --- |
 | Scope identity、层级、context/external reference 和创建 identity | Scope access binding 和 host-local default selection |
-| Source journal head 和 Source record | 搜索 projection 和 index |
+| Source journal head、Source record 和引用的远程 Source Definition manifest | 搜索 projection 和 index |
 | Artifact Revision、lineage、跨 Scope 发布来源和 head | Source cursor 和 scheduler state |
 | Memory entry version 和 head | External Skill registration 和 host-local installation state |
 | Candidate version、decision head 及其 evidence reference | Audit event、usage fact、evaluation receipt 和 restore receipt |
@@ -122,8 +128,9 @@ powercontext archive restore ./payments.pcb --env-file ./oceanbase.env --yes
 
 ## 格式兼容窗口
 
-格式版本 `1` reader 接受任意 PowerContext producer version 生成的格式版本 `1` bundle。producer version 仅用于诊断，
-不能替代 archive schema version。writer 只生成版本 `1`，不支持降级到格式 `0`。遇到未知 archive 或 record schema
+格式版本 `1` reader 还必须支持归档中出现的全部 record type。即使归档使用格式版本 `1`，旧 reader 也可能拒绝新增的
+record type。producer version 仅用于诊断，不能替代 archive schema version 或记录类型兼容性检查。
+writer 只生成版本 `1`，不支持降级到格式 `0`。遇到未知 archive 或 record schema
 version 时，reader 会在目标写入前拒绝。跨 PowerContext 大版本升级时，应保留旧二进制，直到恢复演练通过。
 
 ## 部署原生备份

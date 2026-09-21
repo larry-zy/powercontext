@@ -33,7 +33,7 @@ import sqlite3
 import tempfile
 import zipfile
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from pydantic import ValidationError
 from sqlalchemy import DateTime, insert, or_, select, tuple_, update
 from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.exc import IntegrityError
@@ -67,10 +68,12 @@ from powercontext.builtin.persistence.tables import (
     SCOPE_EXTERNAL_REFERENCES_TABLE,
     SCOPES_TABLE,
     SKILL_PACKAGES_TABLE,
+    SOURCE_DEFINITION_MANIFESTS_TABLE,
     SOURCE_JOURNAL_HEADS_TABLE,
     SOURCES_TABLE,
     TOPIC_MEMORY_REVISION_PUBLICATIONS_TABLE,
 )
+from powercontext.sources import SourceDefinitionManifest, SourceObservation
 
 FORMAT_VERSION = 1
 _RECORDS_NAME = "records.ndjson"
@@ -115,6 +118,7 @@ RecordType = Literal[
     "scope_context_reference",
     "scope_external_reference",
     "scope_creation_request",
+    "source_definition",
     "source_journal_head",
     "source",
     "skill_package",
@@ -209,7 +213,7 @@ class _RecordSpec:
     table: Any
     identity: tuple[str, ...]
     payload: tuple[str, ...]
-    scope_field: str = "scope_id"
+    scope_field: str | None = "scope_id"
 
 
 _SPECS: dict[RecordType, _RecordSpec] = {
@@ -224,6 +228,12 @@ _SPECS: dict[RecordType, _RecordSpec] = {
         SCOPE_CREATION_REQUESTS_TABLE,
         ("idempotency_key",),
         ("request_digest", "scope_id"),
+    ),
+    "source_definition": _RecordSpec(
+        SOURCE_DEFINITION_MANIFESTS_TABLE,
+        ("definition_name", "definition_version"),
+        ("fingerprint", "manifest"),
+        scope_field=None,
     ),
     "source_journal_head": _RecordSpec(SOURCE_JOURNAL_HEADS_TABLE, ("scope_id",), ("position",)),
     "source": _RecordSpec(
@@ -426,6 +436,11 @@ class PortableBundleService:
                 ):
                     shutil.copyfileobj(source, target, length=1024 * 1024)
                 archive.writestr(_zip_info(_MANIFEST_NAME, compression), _canonical_json(manifest))
+            # Publish only an archive with valid structure and complete dependencies.
+            # Reject missing dependencies and size-limit breaches
+            # without replacing a previous usable backup at the destination.
+            _parse_bundle(archive_path)
+            _validate_dependencies(archive_path)
             archive_path.replace(output)
             return BundleReceipt(bundle_id=bundle_id, record_count=count, total_digest=digest)
         finally:
@@ -451,7 +466,9 @@ class PortableBundleService:
         inspection = _parse_bundle(source, progress=progress, phase="validate")
         _validate_dependencies(source)
         required_sources = {
-            str(record.identity["source_type"]) for record in _iter_records(source) if record.record_type == "source"
+            str(record.identity["source_type"])
+            for record in _iter_records(source)
+            if record.record_type == "source" and _source_observation(record) is None
         }
         configured = (
             self._supported_source_types if supported_source_types is None else frozenset(supported_source_types)
@@ -714,15 +731,7 @@ class PortableBundleService:
         records_by_type: Counter[str] = Counter()
         digest = _DigestAccumulator()
         for record_type in _EXPORT_ORDER:
-            spec = _SPECS[record_type]
-            table = spec.table
-            statement = (
-                select(table)
-                .where(table.c[spec.scope_field].in_(scopes))
-                .order_by(*(table.c[field] for field in spec.identity))
-            )
-            rows = await connection.stream(statement)
-            async for row in rows.mappings():
+            async for row in _export_rows(connection, record_type, scopes):
                 record = _record_from_row(record_type, cast(Mapping[str, Any], dict(row)))
                 _validate_record_safe(record)
                 stream.write(_canonical_json(_record_document(record)) + b"\n")
@@ -732,6 +741,83 @@ class PortableBundleService:
                 _report_progress(progress, "export", count, None)
         _report_progress(progress, "export", count, count)
         return count, records_by_type, digest.value()
+
+
+async def _export_rows(
+    connection: AsyncConnection, kind: RecordType, scopes: tuple[str, ...]
+) -> AsyncIterator[Mapping[str, Any]]:
+    spec = _SPECS[kind]
+    if spec.scope_field is not None:
+        rows = await connection.stream(
+            select(spec.table)
+            .where(spec.table.c[spec.scope_field].in_(scopes))
+            .order_by(*(spec.table.c[field] for field in spec.identity))
+        )
+        async for row in rows.mappings():
+            yield cast(Mapping[str, Any], row)
+        return
+
+    # Definition manifests are global, but export authority is scope-bound.
+    # Include only immutable declarations referenced by selected observations.
+    definitions: set[tuple[str, str]] = set()
+    async for row in _export_rows(connection, "source", scopes):
+        observation = _source_observation(_record_from_row("source", row))
+        if observation is not None:
+            definitions.add((observation.source_type, observation.definition_version))
+    table = SOURCE_DEFINITION_MANIFESTS_TABLE
+    for name, definition_version in sorted(definitions):
+        row = (
+            (
+                await connection.execute(
+                    select(table).where(
+                        table.c.definition_name == name, table.c.definition_version == definition_version
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise BundleFormatError("observation references missing Source definition")
+        yield cast(Mapping[str, Any], row)
+
+
+def _source_observation(record: _Record) -> SourceObservation | None:
+    try:
+        value = json.loads(cast(bytes, _database_value(record.payload["payload"])))
+    except (ValueError, UnicodeDecodeError):
+        return None  # Native Source payloads are interpreted by their adapter.
+    if not isinstance(value, dict):
+        return None
+    if value.get("encoding") == "powercontext-source-v1":
+        if value.get("representation") != "observation":
+            return None
+        value = value.get("value")
+    elif "definition_fingerprint" not in value or "source_type" not in value:
+        return None  # Legacy native payload.
+    try:
+        observation = SourceObservation.model_validate_json(_canonical_json(value))
+    except ValidationError as error:
+        raise BundleFormatError("invalid Source observation") from error
+    if (observation.source_type, observation.name) != (record.identity["source_type"], record.identity["source_id"]):
+        raise BundleFormatError("Source observation identity mismatch")
+    return observation
+
+
+def _source_definition(record: _Record) -> SourceDefinitionManifest:
+    try:
+        manifest = SourceDefinitionManifest.model_validate_json(
+            cast(bytes, _database_value(record.payload["manifest"]))
+        )
+    except ValidationError as error:
+        raise BundleFormatError("invalid Source definition manifest") from error
+    if (manifest.name, manifest.version, manifest.fingerprint) != (
+        record.identity["definition_name"],
+        record.identity["definition_version"],
+        record.payload["fingerprint"],
+    ):
+        raise BundleFormatError("Source definition identity mismatch")
+    return manifest
 
 
 def _record_from_row(record_type: RecordType, row: Mapping[str, Any]) -> _Record:
@@ -746,9 +832,11 @@ async def _establish_export_snapshot(connection: AsyncConnection, /) -> None:
     """Pin all export reads to one database snapshot before enumeration."""
 
     if connection.dialect.name == "mysql":
-        # AsyncDatabase has already issued START TRANSACTION for MySQL-mode
-        # engines. Replacing that empty transaction with a consistent snapshot
-        # is safe because authorization has completed and no query has run yet.
+        # Replace AsyncDatabase's empty transaction before any reads. SET
+        # TRANSACTION applies only to the next transaction, so pooled sessions
+        # retain their configured isolation after export.
+        await connection.exec_driver_sql("ROLLBACK")
+        await connection.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         await connection.exec_driver_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT")
     elif connection.dialect.name == "sqlite":
         # SQLAlchemy's SQLite transaction begins lazily.  Pin the snapshot
@@ -1094,6 +1182,10 @@ def _validate_record_values(record: _Record, /) -> None:  # noqa: C901 - one ver
         strings("request_digest", "scope_id")
     elif kind == "source_journal_head":
         integers("position")
+    elif kind == "source_definition":
+        strings("fingerprint")
+        bytes_values("manifest")
+        _source_definition(record)
     elif kind == "source":
         bytes_values("payload")
         integers("journal_position", positive=True)
@@ -1314,6 +1406,8 @@ def _validate_record_dependencies(  # noqa: C901 - logical record kinds have dis
     payload = record.payload
     identity = record.identity
     scope_field = _SPECS[record.record_type].scope_field
+    if scope_field is None:
+        return
     scope = identity.get(scope_field, payload.get(scope_field))
     if not isinstance(scope, str):
         raise BundleFormatError("record has invalid scope identity")
@@ -1329,6 +1423,16 @@ def _validate_record_dependencies(  # noqa: C901 - logical record kinds have dis
     elif record.record_type == "source":
         if not contains("source_journal_head", {"scope_id": scope}):
             raise BundleFormatError("source has no journal head")
+        observation = _source_observation(record)
+        if observation is not None and not contains(
+            "source_definition_fingerprint",
+            {
+                "definition_name": observation.source_type,
+                "definition_version": observation.definition_version,
+                "fingerprint": observation.definition_fingerprint,
+            },
+        ):
+            raise BundleFormatError("observation references missing or mismatched Source definition")
     elif record.record_type == "artifact_revision" and identity["family"] == "topic-memory":
         if not contains("topic_memory_publication", identity):
             raise BundleFormatError("Topic Memory revision has no publication metadata")
@@ -1605,6 +1709,14 @@ def _identity_index(source: Path, /) -> Iterator[Callable[[str, Mapping[str, obj
                 )
             except sqlite3.IntegrityError as error:
                 raise BundleFormatError("bundle contains duplicate immutable identity") from error
+            if record.record_type == "source_definition":
+                connection.execute(
+                    "INSERT INTO identities (record_type, identity) VALUES (?, ?)",
+                    (
+                        "source_definition_fingerprint",
+                        _identity_key({**record.identity, "fingerprint": record.payload["fingerprint"]}),
+                    ),
+                )
             if record.record_type == "memory_entry_version":
                 # Tags survive retirement; inactive entries no longer have a
                 # search projection but retain their authoritative versions.
