@@ -360,7 +360,7 @@ def target_config(tmp_path: Path, short_tmp_path: Path, request: pytest.FixtureR
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("target_definition", ["absent", "identical", "conflicting"])
 def test_archive_preserves_remote_observations_without_worker_adapter(
-    tmp_path: Path, legacy: bool, target_definition: str
+    tmp_path: Path, legacy: bool, target_definition: str, target_config: BuiltinConfig
 ) -> None:
 
     async def scenario() -> None:
@@ -397,7 +397,6 @@ def test_archive_preserves_remote_observations_without_worker_adapter(
                     )
             await source.portability.export([scope.scope_id], archive, authorize=authorize)
             assert (await source.portability.inspect(archive)).records_by_type["source_definition"] == 1
-        target_config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'remote.db'}"))
         async with open_builtin_contexts(target_config) as target:
             if target_definition == "identical":
                 await target.register_source_definition(manifest)
@@ -447,6 +446,17 @@ def test_archive_preserves_remote_observations_without_worker_adapter(
                     SubmitSourceObservation(scope_id=scope.scope_id, observation=observation)
                 )
             ).sequence == 1
+            roundtrip = tmp_path / "remote-roundtrip.pcb"
+            await target.portability.export([scope.scope_id], roundtrip, authorize=authorize)
+        async with open_builtin_contexts(BuiltinConfig()) as reverse:
+            assert (await reverse.portability.restore(roundtrip)).projections_ready
+            async with reverse.database.transaction() as connection:
+                restored = await reverse.repositories.sources.get(
+                    connection,
+                    scope.scope_id,
+                    SourceRef(source_type=observation.source_type, source_id=observation.name),
+                )
+                assert restored.value == observation
 
     asyncio.run(scenario())
 
