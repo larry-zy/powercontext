@@ -27,13 +27,6 @@ import typer
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from powercontext.builtin.artifacts.experience import Experience
-from powercontext.builtin.artifacts.handoff import Handoff
-from powercontext.builtin.artifacts.memory import Memory
-from powercontext.builtin.artifacts.profile import Profile
-from powercontext.builtin.artifacts.prompt import Prompt
-from powercontext.builtin.artifacts.skill import Skill
-from powercontext.builtin.artifacts.topic_memory import TopicMemory
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig, OceanBaseProfile
 from powercontext.builtin.persistence.seekdb import SeekDBConfig, SeekDBProfile
@@ -48,6 +41,7 @@ from powercontext.builtin.portability import (
     PortableBundleService,
 )
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_runtime
+from powercontext.builtin.runtime.relational import BUILTIN_ARTIFACT_TYPES
 from powercontext.builtin.sources import BUILTIN_SOURCE_REGISTRY
 from powercontext.paths import default_scheduler_path
 from powercontext.server.configuration import server_settings_context
@@ -180,15 +174,7 @@ async def _validate_with_database(database: AsyncDatabase, source: Path, /) -> B
         database,
         projection_rebuilder=projection_capability,
         supported_source_types=tuple(definition.name for definition in BUILTIN_SOURCE_REGISTRY.definitions),
-        supported_artifact_families=(
-            Handoff.family,
-            Memory.family,
-            Experience.family,
-            Skill.family,
-            Profile.family,
-            Prompt.family,
-            TopicMemory.family,
-        ),
+        supported_artifact_families=tuple(artifact.family for artifact in BUILTIN_ARTIFACT_TYPES),
     )
     return await archive.validate(source, progress=_emit_progress)
 

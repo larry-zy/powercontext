@@ -258,6 +258,9 @@ _MEMORY_COMMIT_MEMORY_CHANGED = "powercontext.memory.commit.memory_changed"
 _MEMORY_COMMIT_ENTRY_VERSION_COUNT = "powercontext.memory.commit.entry_version_count"
 
 
+BUILTIN_ARTIFACT_TYPES = (Handoff, Memory, Experience, Skill, Profile, Prompt, TopicMemory)
+
+
 @dataclass(frozen=True, slots=True)
 class _Repositories:
     """Repositories shared by every scoped context."""
@@ -527,27 +530,19 @@ class RelationalContexts:
         self.database = database
         self.scopes = ScopeApplication(database, cursor_secret=cursor_secret)
         self.source_registry = source_registry or BUILTIN_SOURCE_REGISTRY
-        self.portability = PortableBundleService(
-            database,
-            projection_rebuilder=self.rebuild_portable_projections,
-            supported_source_types=tuple(definition.name for definition in self.source_registry.definitions),
-            supported_artifact_families=(
-                Handoff.family,
-                Memory.family,
-                Experience.family,
-                Skill.family,
-                Profile.family,
-                Prompt.family,
-                TopicMemory.family,
-            ),
-        )
         self.index = NoMemoryIndex() if index is None else index
         self.topic_memory_index = NoTopicMemoryIndex() if topic_memory_index is None else topic_memory_index
         self.experience_index = NoExperienceIndex() if experience_index is None else experience_index
         source_repository = SourceRepository(self.source_registry)
         artifact_repository = ArtifactRepository(
-            (Handoff, Memory, Experience, Skill, Profile, Prompt, TopicMemory),
+            BUILTIN_ARTIFACT_TYPES,
             sources=source_repository,
+        )
+        self.portability = PortableBundleService(
+            database,
+            projection_rebuilder=self.rebuild_portable_projections,
+            supported_source_types=tuple(definition.name for definition in self.source_registry.definitions),
+            supported_artifact_families=artifact_repository.families,
         )
         topic_memory_repository = TopicMemoryRepository(artifacts=artifact_repository, index=self.topic_memory_index)
         self.repositories = _Repositories(

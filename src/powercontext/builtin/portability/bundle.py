@@ -43,7 +43,7 @@ from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import ValidationError
-from sqlalchemy import DateTime, insert, or_, select, tuple_, update
+from sqlalchemy import DateTime, insert, select, tuple_, update
 from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -414,7 +414,6 @@ class PortableBundleService:
                     count, records_by_type, digest = await self._stream_export(
                         connection, selected, stream, progress=progress
                     )
-                    await _validate_export_journal_snapshot(connection, selected)
             bundle_id = str(uuid5(NAMESPACE_URL, f"powercontext:portable:v{FORMAT_VERSION}:{digest}"))
             manifest = {
                 "format_version": FORMAT_VERSION,
@@ -464,17 +463,11 @@ class PortableBundleService:
         """Verify bundle integrity, dependencies, and optional adapter support."""
 
         inspection = _parse_bundle(source, progress=progress, phase="validate")
-        _validate_dependencies(source)
-        required_sources = {
-            str(record.identity["source_type"])
-            for record in _iter_records(source)
-            if record.record_type == "source" and _source_observation(record) is None
-        }
+        required_sources, required_families = _validate_dependencies(source)
         configured = (
             self._supported_source_types if supported_source_types is None else frozenset(supported_source_types)
         )
         missing_sources = () if configured is None else tuple(sorted(required_sources - configured))
-        required_families = _required_artifact_families(_iter_records(source))
         missing_families = (
             ()
             if self._supported_artifact_families is None
@@ -843,29 +836,6 @@ async def _establish_export_snapshot(connection: AsyncConnection, /) -> None:
         # before the first table is enumerated so later SELECTs cannot observe
         # a writer that committed midway through the export.
         await connection.exec_driver_sql("BEGIN")
-
-
-async def _validate_export_journal_snapshot(connection: AsyncConnection, scopes: tuple[str, ...], /) -> None:
-    """Reject a snapshot whose Sources advance beyond its journal head."""
-
-    invalid = await connection.scalar(
-        select(SOURCES_TABLE.c.source_id)
-        .join(
-            SOURCE_JOURNAL_HEADS_TABLE,
-            SOURCE_JOURNAL_HEADS_TABLE.c.scope_id == SOURCES_TABLE.c.scope_id,
-            isouter=True,
-        )
-        .where(
-            SOURCES_TABLE.c.scope_id.in_(scopes),
-            or_(
-                SOURCE_JOURNAL_HEADS_TABLE.c.position.is_(None),
-                SOURCES_TABLE.c.journal_position > SOURCE_JOURNAL_HEADS_TABLE.c.position,
-            ),
-        )
-        .limit(1)
-    )
-    if invalid is not None:
-        raise BundleFormatError("source journal snapshot is inconsistent")
 
 
 def _record_document(record: _Record) -> dict[str, Any]:
@@ -1383,19 +1353,23 @@ def _validate_safe_value(value: object, key: str | None = None) -> None:
             _validate_safe_value(child, key)
 
 
-def _validate_dependencies(source: Path, /) -> None:
-    """Check references with a temporary on-disk identity index.
+def _validate_dependencies(source: Path, /) -> tuple[set[str], set[str]]:
+    """Validate dependencies with disk-backed identities and bounded metadata."""
 
-    The index deliberately stores only canonical identities, never record
-    payloads.  This permits dependency validation for large bundles without
-    retaining their content in the importing process.
-    """
-
+    heads, packages = _dependency_metadata(source)
+    required_sources: set[str] = set()
+    required_families: set[str] = set()
     with _identity_index(source) as contains:
         for record in _iter_records(source):
             _validate_record_dependencies(record, contains)
-    _validate_skill_package_dependencies(source)
-    _validate_source_journal_records(source)
+            _validate_skill_package_dependency(record, packages)
+            if record.record_type == "source":
+                if int(record.payload["journal_position"]) > heads.get(str(record.identity["scope_id"]), -1):
+                    raise BundleFormatError("source journal snapshot is inconsistent")
+                if _source_observation(record) is None:
+                    required_sources.add(str(record.identity["source_type"]))
+            required_families.update(_required_artifact_families((record,)))
+    return required_sources, required_families
 
 
 def _validate_record_dependencies(  # noqa: C901 - logical record kinds have distinct dependency edges.
@@ -1605,22 +1579,12 @@ def _contains_memory_entry_target(
     )
 
 
-def _validate_source_journal_records(source: Path, /) -> None:
-    heads = {
-        str(record.identity["scope_id"]): int(record.payload["position"])
-        for record in _iter_records(source)
-        if record.record_type == "source_journal_head"
-    }
-    for record in _iter_records(source):
-        if record.record_type == "source" and int(record.payload["journal_position"]) > heads.get(
-            str(record.identity["scope_id"]), -1
-        ):
-            raise BundleFormatError("source journal snapshot is inconsistent")
-
-
-def _validated_skill_packages(source: Path, /) -> dict[tuple[str, str], tuple[str, int, int, int]]:
+def _dependency_metadata(source: Path, /) -> tuple[dict[str, int], dict[tuple[str, str], tuple[str, int, int, int]]]:
+    heads: dict[str, int] = {}
     packages: dict[tuple[str, str], tuple[str, int, int, int]] = {}
     for record in _iter_records(source):
+        if record.record_type == "source_journal_head":
+            heads[str(record.identity["scope_id"])] = int(record.payload["position"])
         if record.record_type != "skill_package":
             continue
         try:
@@ -1644,41 +1608,41 @@ def _validated_skill_packages(source: Path, /) -> dict[tuple[str, str], tuple[st
             snapshot.reference.uncompressed_size,
             snapshot.reference.archive_size,
         )
-    return packages
+    return heads, packages
 
 
-def _validate_skill_package_dependencies(source: Path, /) -> None:
-    packages = _validated_skill_packages(source)
-    for record in _iter_records(source):
-        if record.record_type == "artifact_revision" and record.identity["family"] == "skill":
-            content = _decoded_bytes_json(record.payload["content"], "Skill content")
-        elif record.record_type == "candidate_version" and record.payload["family"] == "skill":
-            content = _decoded_bytes_json(record.payload["proposal"], "Skill proposal")
-        else:
-            continue
-        package = content.get("package") if isinstance(content, dict) else None
-        if package is None:
-            continue
-        if not isinstance(package, dict):
-            raise BundleFormatError("Skill package reference is invalid")
-        typed_package = cast(dict[str, object], package)
-        tree_digest = typed_package.get("tree_digest")
-        archive_digest = typed_package.get("archive_digest")
-        sizes = (
-            typed_package.get("file_count"),
-            typed_package.get("uncompressed_size"),
-            typed_package.get("archive_size"),
-        )
-        if (
-            not isinstance(tree_digest, str)
-            or not isinstance(archive_digest, str)
-            or any(isinstance(value, bool) or not isinstance(value, int) for value in sizes)
-        ):
-            raise BundleFormatError("Skill package reference is invalid")
-        expected = (archive_digest, cast(int, sizes[0]), cast(int, sizes[1]), cast(int, sizes[2]))
-        key = (str(record.identity["scope_id"]), tree_digest)
-        if packages.get(key) != expected:
-            raise BundleFormatError("Skill artifact references missing or mismatched package")
+def _validate_skill_package_dependency(
+    record: _Record, packages: Mapping[tuple[str, str], tuple[str, int, int, int]], /
+) -> None:
+    if record.record_type == "artifact_revision" and record.identity["family"] == "skill":
+        content = _decoded_bytes_json(record.payload["content"], "Skill content")
+    elif record.record_type == "candidate_version" and record.payload["family"] == "skill":
+        content = _decoded_bytes_json(record.payload["proposal"], "Skill proposal")
+    else:
+        return
+    package = content.get("package") if isinstance(content, dict) else None
+    if package is None:
+        return
+    if not isinstance(package, dict):
+        raise BundleFormatError("Skill package reference is invalid")
+    typed_package = cast(dict[str, object], package)
+    tree_digest = typed_package.get("tree_digest")
+    archive_digest = typed_package.get("archive_digest")
+    sizes = (
+        typed_package.get("file_count"),
+        typed_package.get("uncompressed_size"),
+        typed_package.get("archive_size"),
+    )
+    if (
+        not isinstance(tree_digest, str)
+        or not isinstance(archive_digest, str)
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in sizes)
+    ):
+        raise BundleFormatError("Skill package reference is invalid")
+    expected = (archive_digest, cast(int, sizes[0]), cast(int, sizes[1]), cast(int, sizes[2]))
+    key = (str(record.identity["scope_id"]), tree_digest)
+    if packages.get(key) != expected:
+        raise BundleFormatError("Skill artifact references missing or mismatched package")
 
 
 def _decoded_bytes_json(value: object, name: str, /) -> object:
