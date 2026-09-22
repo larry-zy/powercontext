@@ -4347,6 +4347,37 @@ async def require_scope_content_ready(request: Request, scope_id: str) -> None:
             raise AccessUnavailableError("artifact_owner_pending")
 
 
+async def _check_missing_memory_reads(
+    request: Request,
+    access: AccessControlService,
+    checks: Sequence[tuple[AccessAction, ResourceRef]],
+    context: AccessAuditContext,
+) -> None:
+    # A missing owner alone cannot distinguish an absent entry from a pending
+    # owner write. Inspect identities only after authorizing the parent Scope.
+    for action, resource in checks:
+        if (
+            action is not AccessAction.ARTIFACT_READ
+            or resource.family != "memory"
+            or resource.scope_id is None
+            or not isinstance(resource.selector, MemoryEntrySelector)
+        ):
+            continue
+        decision = await access.check(
+            current_principal(), AccessAction.SCOPE_READ, ResourceRef.scope(resource.scope_id), context=context
+        )
+        if not decision.allowed:
+            continue
+        identities = await _require_application(request).records.for_scope(resource.scope_id).logical_artifacts()
+        if not any(
+            identity.family == resource.family
+            and identity.artifact_id == resource.artifact_id
+            and identity.entry_id == resource.selector.entry_id
+            for identity in identities
+        ):
+            raise MemoryEntryNotFoundError(resource.selector.entry_id)
+
+
 def _authorization_dependency(
     operation: Operation[Any, Any],
 ) -> Callable[[Request], Awaitable[None]]:
@@ -4365,11 +4396,16 @@ def _authorization_dependency(
             context = _access_audit_context(operation.operation_id)
             for scope_id in sorted({resource.scope_id for _, resource in checks if resource.scope_id is not None}):
                 await access.bootstrap_static_scope(current_principal(), scope_id, context=context)
-            if len(checks) == 1:
-                action, resource = checks[0]
-                await access.require(current_principal(), action, resource, context=context)
-            else:
-                await access.require_all(current_principal(), checks, context=context)
+            try:
+                if len(checks) == 1:
+                    action, resource = checks[0]
+                    await access.require(current_principal(), action, resource, context=context)
+                else:
+                    await access.require_all(current_principal(), checks, context=context)
+            except AccessUnavailableError as error:
+                if error.code == "artifact_owner_pending":
+                    await _check_missing_memory_reads(request, access, checks, context)
+                raise
             if operation.operation_id in _COLLECTION_CONTENT_OPERATIONS:
                 for scope_id in sorted({
                     resource.scope_id
@@ -5431,12 +5467,27 @@ def _map_domain_error(error: Exception) -> tuple[int, str, str, dict[str, Any] |
             InvalidRuntimeRequestError,
         ),
     ):
-        return status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_request", "The request is invalid.", None
+        return (
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "invalid_request",
+            "The request is invalid.",
+            _invalid_request_details(error),
+        )
     if isinstance(error, InferenceTimeoutError):
         return status.HTTP_503_SERVICE_UNAVAILABLE, "inference_timeout", "Model inference timed out.", None
     if isinstance(error, InferenceUnavailableError):
         return status.HTTP_503_SERVICE_UNAVAILABLE, "inference_unavailable", "Model inference is unavailable.", None
     return status.HTTP_500_INTERNAL_SERVER_ERROR, "internal_error", "The Server failed.", None
+
+
+def _invalid_request_details(error: Exception) -> dict[str, Any] | None:
+    if (
+        isinstance(error, InvalidMemoryCandidateError)
+        and error.code == "canonical"
+        and error.canonical_code is not None
+    ):
+        return {"code": error.canonical_code, "message": str(error.detail)}
+    return None
 
 
 def _map_source_ingestion_error(error: Exception) -> tuple[int, str, str, dict[str, Any] | None] | None:

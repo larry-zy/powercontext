@@ -7,7 +7,7 @@ OPENAPI_SCHEMA: dict[str, JsonValue] = {
     "info": {
         "title": "PowerContext API",
         "description": "Remote PowerContext transport. Runtime behavior is reported by /v1/capabilities.",
-        "version": "1.0.0",
+        "version": "1.1.0",
     },
     "paths": {
         "/v1/scopes/{scope_id}/subject-sources": {
@@ -8902,8 +8902,26 @@ OPENAPI_SCHEMA: dict[str, JsonValue] = {
             },
             "SourceTypeReference": {
                 "properties": {
-                    "source_type": {"type": "string", "enum": ["content"]},
-                    "source_id": {"type": "string", "maxLength": 256, "minLength": 1, "pattern": "^[\\x21-\\x7E]+$"},
+                    "source_type": {
+                        "type": "string",
+                        "description": "Stable Source type, including dynamically registered Source names.",
+                    },
+                    "source_id": {
+                        "type": "string",
+                        "maxLength": 256,
+                        "minLength": 1,
+                        "description": "Source "
+                        "identity "
+                        "as "
+                        "accepted "
+                        "at "
+                        "ingestion, "
+                        "including "
+                        "Unicode "
+                        "and "
+                        "interior "
+                        "spaces.",
+                    },
                 },
                 "additionalProperties": False,
                 "type": "object",

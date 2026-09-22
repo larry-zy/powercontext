@@ -26,12 +26,14 @@ from uuid import uuid4
 from powercontext.artifacts import Artifact, ArtifactLineage, ArtifactRef
 from powercontext.builtin.artifacts.memory.canonical import (
     canonical_embedding,
+    canonical_error_code,
     canonical_json,
     embedding_content_hash,
     entry_content_bytes,
     entry_content_hash,
     memory_content_hash,
     normalize_kind,
+    normalize_query,
     normalize_reason,
     normalize_text,
     validate_identifier,
@@ -80,12 +82,13 @@ from powercontext.builtin.artifacts.memory.protocols import (
 )
 from powercontext.builtin.artifacts.memory.reranking import MemoryReranker
 from powercontext.builtin.artifacts.prompt.service import ScopedPrompts, current_prompt, prompt_operation
-from powercontext.builtin.artifacts.search import AdmissionCounts, AdmissionFloor, analyze_text
+from powercontext.builtin.artifacts.search import AdmissionCounts, AdmissionFloor, analyze_fts_query, analyze_text
 from powercontext.builtin.inference import (
     EmbeddingModel,
     EmbeddingVector,
     InferenceTimeoutError,
     InferenceUnavailableError,
+    embed_query,
 )
 from powercontext.builtin.tags import TagFilter
 from powercontext.errors import RevisionConflictError
@@ -136,6 +139,7 @@ class _InvalidMemoryOperationError(ValueError):
             "search-memories": "memory search requires at least one explicit Memory ref",
             "search-limit": "memory search limit must be positive",
             "search-mode": "unsupported memory search mode",
+            "search-query": "memory search query must be non-empty text",
         }
         super().__init__(messages[code])
 
@@ -452,7 +456,10 @@ class MemoryService:
             memories=selected_memories,
             capabilities=capabilities,
         )
-        normalized_query = normalize_text(query)
+        try:
+            normalized_query = normalize_query(query)
+        except (TypeError, ValueError) as error:
+            raise _InvalidMemoryOperationError("search-query") from error
         query_vector = None
         profile = None
         embedding_calls = 0
@@ -484,7 +491,7 @@ class MemoryService:
         coarse_limit = limit if self._reranker is None else max(limit, self._rerank_candidate_limit)
         request = MemorySearchRequest(
             query=normalized_query,
-            analyzed_query=analyze_text(normalized_query),
+            analyzed_query=analyze_fts_query(normalized_query),
             memories=selected_memories,
             candidate_limit=max(coarse_limit * 4, 32),
             mode=selected_mode,
@@ -539,7 +546,7 @@ class MemoryService:
         if reuse is not None and reuse.embedding_profile == profile:
             return selected_mode, reuse.query_vector, reuse, 0
         try:
-            query_vector = (await self._embed_texts((query,), profile))[0]
+            query_vector = (await self._embed_texts((query,), profile, query=True))[0]
         except (InferenceUnavailableError, InferenceTimeoutError) as error:
             if requested_mode == "auto" and capabilities.fts:
                 return "fts", None, None, 1
@@ -987,11 +994,13 @@ class MemoryService:
         self,
         texts: tuple[str, ...],
         profile: EmbeddingProfile,
+        *,
+        query: bool = False,
     ) -> tuple[EmbeddingVector, ...]:
         embedding_model = self._embedding_model
         if embedding_model is None or embedding_model.profile != profile:
             raise CapabilityNotSupportedError("embedding-profile")
-        result = await embedding_model.embed(texts)
+        result = await embed_query(embedding_model, texts) if query else await embedding_model.embed(texts)
         vectors = result.vectors
         if len(vectors) != len(texts):
             raise InvalidEmbeddingError("count")
@@ -1260,7 +1269,11 @@ class MemoryService:
                 artifacts=artifacts,
             )
         except (TypeError, ValueError) as error:
-            raise InvalidMemoryCandidateError("canonical", str(error)) from error
+            raise InvalidMemoryCandidateError(
+                "canonical",
+                str(error),
+                canonical_code=canonical_error_code(error),
+            ) from error
 
     async def _canonical_candidate_sources(
         self,
