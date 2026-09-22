@@ -93,6 +93,10 @@ powercontext archive restore ./backups/payments.pcb --yes
 它是权威的 round-trip 格式。CSV 可以单独用于有边界的分析，但无法保留不可变 revision、lineage 或 evidence reference，
 不得用于恢复。
 
+归档保留已冻结的 recurrence 匹配决策与事件，包括原始幂等键、Source 位置和精确 Artifact revision。
+恢复前会校验候选 revision、Handoff/receipt 引用及事件关联的匹配记录。Experience 当前版本推进后，
+历史决策仍保持不变；恢复后的重放复用已保存的决策。
+
 ## 恢复和冲突处理
 
 恢复是幂等的。重复回放同一归档时，内容相同的 record 会计入 `already_present`。已有不可变 identity 对应不同 payload

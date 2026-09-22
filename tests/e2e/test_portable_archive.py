@@ -29,7 +29,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from pydantic import SecretStr
+from pydantic import JsonValue, SecretStr
 from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.engine import make_url
 
@@ -591,5 +591,270 @@ def test_restore_rejects_invalid_remote_source_dependencies_before_writing(tmp_p
                     )
                     is None
                 )
+
+    asyncio.run(scenario())
+
+
+async def _replay_recurrence(contexts, scope_id):
+    from powercontext.builtin.evidence.resolver import EvidenceResolver
+    from powercontext.builtin.runtime.recurrence import RelationalRecurrenceLedger
+
+    async def no_memory(*_args):
+        raise AssertionError("fixture has no Memory citations")  # noqa: TRY003
+
+    repositories = contexts.repositories
+    ledger = RelationalRecurrenceLedger(
+        database=contexts.database,
+        scope_id=scope_id,
+        sources=repositories.sources,
+        artifacts=repositories.artifacts,
+        recurrence=repositories.recurrence,
+        evidence=EvidenceResolver(
+            scope_id=scope_id,
+            sources=repositories.sources,
+            artifacts=repositories.artifacts,
+            memory_reader=no_memory,
+        ),
+    )
+    async with contexts.database.transaction() as connection:
+        position = await repositories.sources.journal_position(connection, scope_id)
+        rows = await repositories.sources.list_window(connection, scope_id, after=0, through=position)
+        await ledger.record_window(connection, rows)
+        return (
+            await repositories.recurrence.matches(connection, scope_id),
+            await repositories.recurrence.observations(connection, scope_id),
+        )
+
+
+async def _recurrence_archive(tmp_path):
+    from powercontext.builtin.artifacts.handoff.models import HandoffArtifactCitation
+    from powercontext.builtin.work.models import HandoffReceipt, TaskCheck, TaskOutcome, WorkClaim
+
+    archive = tmp_path / "recurrence.pcb"
+    async with open_builtin_contexts(BuiltinConfig()) as source:
+        scope = await source.scopes.create(
+            ScopeDraft(title="Recurrence", summary="Frozen decisions", idempotency_key="recurrence")
+        )
+        sid = scope.scope_id
+        content: dict[str, JsonValue] = {
+            "situation": "Contract changed",
+            "action": "Regenerate client",
+            "outcome": "Client agrees",
+            "lesson": "Regenerate after changing the contract",
+            "failure": {
+                "signature": {"recall_cue": "client is stale", "symptom": "client diverges"},
+                "repair_surface": "experience_content",
+                "verification": {"condition": "contract changed", "check_subject": "client agrees"},
+            },
+        }
+        experience = await source.records.create_artifact(sid, "experience", ArtifactWrite(content=content))
+        ref = ArtifactRef(family="experience", artifact_id=experience.artifact_id, revision=1)
+        citation = HandoffArtifactCitation(artifact_ref=ref)
+        handoff = await source.records.create_artifact(
+            sid,
+            "handoff",
+            ArtifactWrite(
+                content={
+                    "objective": "Regenerate client",
+                    "disposition": "continuable",
+                    "state": [{"text": "Use this experience", "citations": [citation.model_dump(mode="json")]}],
+                }
+            ),
+        )
+        context = await source.get(sid)
+        receipt = HandoffReceipt(
+            receiver="archive-test",
+            status="accepted",
+            selection="exact",
+            evidence_status="available",
+            selected_revision=ArtifactRef(family="handoff", artifact_id=handoff.artifact_id, revision=1),
+        )
+        await context.sources.capture(
+            ContentCapture(
+                source_id="receipt",
+                content=receipt.model_dump_json(),
+                metadata={"kind": "handoff-receipt"},
+            )
+        )
+        receipt_ref = SourceRef(source_type="content", source_id="receipt")
+        for name, linked in (("linked-failure", True), ("unlinked-failure", False)):
+            outcome = TaskOutcome(
+                objective="Regenerate client",
+                summary="Failed",
+                status="failed",
+                observations=(WorkClaim(text="Client regeneration failed", basis="declared"),),
+                handoff_receipt_ref=receipt_ref if linked else None,
+                checks=(TaskCheck(name="client is stale", status="failed", basis="verified", evidence=(citation,)),),
+            )
+            await context.sources.capture(
+                ContentCapture(
+                    source_id=name,
+                    content=outcome.model_dump_json(),
+                    metadata={"kind": "task-outcome"},
+                )
+            )
+        success = TaskOutcome(
+            objective="Regenerate client",
+            summary="Passed",
+            status="succeeded",
+            handoff_receipt_ref=receipt_ref,
+            observations=(WorkClaim(text="contract changed", basis="verified", evidence=(citation,)),),
+            checks=(TaskCheck(name="client agrees", status="passed", basis="verified", evidence=(citation,)),),
+        )
+        await context.sources.capture(
+            ContentCapture(
+                source_id="success",
+                content=success.model_dump_json(),
+                metadata={"kind": "task-outcome"},
+            )
+        )
+        expected = await _replay_recurrence(source, sid)
+        assert len(expected[0]) == 2
+        assert len(expected[1]) == 5
+        assert {event.event for event in expected[1]} == {"selected", "recurred", "avoided"}
+        assert all(match.artifact_ref == ref for match in expected[0])
+        # Remove the signature from the current head. Recomputing an unlinked
+        # failure against this head would lose the original revision-1 match.
+        content["failure"] = None
+        await source.records.replace_artifact(
+            sid,
+            "experience",
+            experience.artifact_id,
+            '"revision:1"',
+            ArtifactWrite(content=content),
+        )
+        assert await _replay_recurrence(source, sid) == expected
+
+        async def authorize(_scopes):
+            pass
+
+        await source.portability.export([sid], archive, authorize=authorize)
+    return archive, sid, experience.artifact_id, expected
+
+
+def test_archive_preserves_frozen_recurrence_after_restart(tmp_path: Path, target_config: BuiltinConfig) -> None:
+    async def scenario():
+        archive, sid, artifact_id, expected = await _recurrence_archive(tmp_path)
+        async with open_builtin_contexts(target_config) as target:
+            assert (await target.portability.validate(archive)).compatible
+            assert (await target.portability.restore(archive)).projections_ready
+            assert (await target.portability.restore(archive)).inserted == 0
+        async with open_builtin_contexts(target_config) as target:
+            assert (await target.records.get_artifact(sid, "experience", artifact_id)).revision == 2
+            async with target.database.transaction() as connection:
+                assert await target.repositories.recurrence.matches(connection, sid) == expected[0]
+                assert await target.repositories.recurrence.observations(connection, sid) == expected[1]
+            assert await _replay_recurrence(target, sid) == expected
+            assert await _replay_recurrence(target, sid) == expected
+
+            async def authorize(_scopes):
+                pass
+
+            roundtrip = tmp_path / "recurrence-roundtrip.pcb"
+            await target.portability.export([sid], roundtrip, authorize=authorize)
+        async with open_builtin_contexts(BuiltinConfig()) as reverse:
+            await reverse.portability.restore(roundtrip)
+            assert await _replay_recurrence(reverse, sid) == expected
+
+    asyncio.run(scenario())
+
+
+def _rewrite_archive_records(archive, transform):
+    with zipfile.ZipFile(archive) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+        records = [json.loads(line) for line in bundle.read("records.ndjson").splitlines()]
+    records = transform(records)
+    for record in records:
+        record.pop("digest", None)
+        record["digest"] = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
+    manifest["record_count"] = len(records)
+    manifest["records_by_type"] = dict(Counter(record["record_type"] for record in records))
+    manifest["total_digest"] = (
+        "sha256:" + hashlib.sha256("\n".join(record["digest"] for record in records).encode()).hexdigest()
+    )
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("manifest.json", json.dumps(manifest))
+        bundle.writestr("records.ndjson", "\n".join(json.dumps(record) for record in records) + "\n")
+
+
+@pytest.mark.parametrize("damage", ["outcome", "receipt", "revision", "handoff", "match", "payload", "key", "position"])
+def test_archive_rejects_broken_recurrence_before_writing(tmp_path: Path, damage: str) -> None:
+    async def scenario():
+        archive, sid, _, _ = await _recurrence_archive(tmp_path)
+
+        def damage_records(records):
+            if damage in {"outcome", "receipt"}:
+                source_id = "unlinked-failure" if damage == "outcome" else "receipt"
+                return [
+                    r for r in records if not (r["record_type"] == "source" and r["identity"]["source_id"] == source_id)
+                ]
+            if damage in {"revision", "handoff"}:
+                family = "experience" if damage == "revision" else "handoff"
+                return [
+                    r
+                    for r in records
+                    if not (
+                        r["record_type"] == "artifact_revision"
+                        and r["identity"]["family"] == family
+                        and r["identity"]["revision"] == 1
+                    )
+                ]
+            if damage == "match":
+                return [r for r in records if r["record_type"] != "recurrence_match"]
+            if damage == "position":
+                record = next(
+                    r
+                    for r in records
+                    if r["record_type"] == "source" and r["identity"]["source_id"] == "unlinked-failure"
+                )
+                record["payload"]["journal_position"] = 1
+                return records
+            record = next(r for r in records if r["record_type"] == "recurrence_observation")
+            if damage == "payload":
+                record["payload"]["payload"] = {"base64": base64.b64encode(b"{}").decode()}
+            else:
+                record["payload"]["selection_key"] = "sha256:" + "0" * 64
+            return records
+
+        _rewrite_archive_records(archive, damage_records)
+        async with open_builtin_contexts(BuiltinConfig()) as target:
+            with pytest.raises(BundleFormatError):
+                await target.portability.validate(archive)
+            with pytest.raises(BundleFormatError):
+                await target.portability.restore(archive)
+            async with target.database.transaction() as connection:
+                assert (
+                    await connection.scalar(select(SCOPES_TABLE.c.scope_id).where(SCOPES_TABLE.c.scope_id == sid))
+                    is None
+                )
+
+    asyncio.run(scenario())
+
+
+def test_archive_rejects_recomputed_recurrence_without_overwriting_history(tmp_path: Path) -> None:
+    async def scenario():
+        archive, sid, _, expected = await _recurrence_archive(tmp_path)
+        without_history = tmp_path / "without-history.pcb"
+        without_history.write_bytes(archive.read_bytes())
+        _rewrite_archive_records(
+            without_history,
+            lambda records: [r for r in records if not r["record_type"].startswith("recurrence_")],
+        )
+        async with open_builtin_contexts(BuiltinConfig()) as target:
+            await target.portability.restore(without_history)
+            recomputed = await _replay_recurrence(target, sid)
+            assert recomputed != expected
+            assert any(match.result == "unmatched" for match in recomputed[0])
+            validation = await target.portability.validate(archive)
+            assert not validation.compatible
+            assert validation.conflicts > 0
+            with pytest.raises(BundleConflictError):
+                await target.portability.restore(archive)
+            assert await _replay_recurrence(target, sid) == recomputed
 
     asyncio.run(scenario())

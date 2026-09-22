@@ -48,6 +48,15 @@ from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from powercontext.builtin.artifacts.experience.recurrence import (
+    RecurrenceMatch,
+    RecurrenceObservation,
+    canonical_digest,
+    match_key,
+    observation_identity,
+    selection_key,
+    verdict_key,
+)
 from powercontext.builtin.artifacts.skill.package import SkillPackageError, capture_skill_archive
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.tables import (
@@ -63,6 +72,8 @@ from powercontext.builtin.persistence.tables import (
     MEMORY_ENTRY_VERSIONS_TABLE,
     PORTABLE_RESTORE_RECEIPTS_TABLE,
     PROFILE_POLICIES_TABLE,
+    RECURRENCE_MATCH_TABLE,
+    RECURRENCE_OBSERVATION_TABLE,
     SCOPE_CONTEXT_REFERENCES_TABLE,
     SCOPE_CREATION_REQUESTS_TABLE,
     SCOPE_EXTERNAL_REFERENCES_TABLE,
@@ -134,6 +145,8 @@ RecordType = Literal[
     "topic_memory_publication",
     "profile_policy",
     "artifact_tag",
+    "recurrence_match",
+    "recurrence_observation",
 ]
 ProjectionRebuilder = Callable[[tuple[str, ...]], Awaitable[None]]
 ExportAuthorizer = Callable[[tuple[str, ...]], Awaitable[None]]
@@ -349,6 +362,44 @@ _SPECS: dict[RecordType, _RecordSpec] = {
         ARTIFACT_TAGS_TABLE,
         ("scope_id", "family", "artifact_id", "target_type", "target_id", "tag_key"),
         ("tag_key_hash", "tag", "assigned_at"),
+    ),
+    # Use ledger uniqueness identities so a changed decision is a conflict,
+    # even when its content-derived match key or observation ID also changes.
+    "recurrence_match": _RecordSpec(
+        RECURRENCE_MATCH_TABLE,
+        ("scope_id", "task_outcome_source_type", "task_outcome_source_id", "failure_item_kind", "failure_item_index"),
+        (
+            "match_key",
+            "task_outcome_position",
+            "failure_item_digest",
+            "candidate_set_mode",
+            "candidate_set_digest",
+            "result",
+            "target_family",
+            "target_artifact_id",
+            "target_revision",
+            "signature_key",
+            "payload",
+        ),
+    ),
+    "recurrence_observation": _RecordSpec(
+        RECURRENCE_OBSERVATION_TABLE,
+        ("scope_id", "verdict_key"),
+        (
+            "observation_id",
+            "selection_key",
+            "event",
+            "match_basis",
+            "family",
+            "artifact_id",
+            "revision",
+            "signature_key",
+            "signature_key_hash",
+            "task_outcome_source_type",
+            "task_outcome_source_id",
+            "task_outcome_position",
+            "payload",
+        ),
     ),
 }
 
@@ -1159,6 +1210,9 @@ def _validate_record_values(record: _Record, /) -> None:  # noqa: C901 - one ver
     elif kind == "source":
         bytes_values("payload")
         integers("journal_position", positive=True)
+    elif kind in {"recurrence_match", "recurrence_observation"}:
+        bytes_values("payload")
+        _recurrence_value(record)
     elif kind == "skill_package":
         strings("archive_digest")
         bytes_values("archive_bytes", "manifest")
@@ -1270,6 +1324,54 @@ def _validate_record_values(record: _Record, /) -> None:  # noqa: C901 - one ver
             raise BundleFormatError("artifact tag has invalid target")
         if _database_value(payload["tag_key_hash"]) != hashlib.sha256(str(identity["tag_key"]).encode()).digest():
             raise BundleFormatError("artifact tag has invalid key hash")
+
+
+def _recurrence_value(record: _Record, /) -> RecurrenceMatch | RecurrenceObservation:
+    """Check frozen payloads against their indexed fields and idempotency keys."""
+    model = RecurrenceMatch if record.record_type == "recurrence_match" else RecurrenceObservation
+    try:
+        value = model.model_validate_json(cast(bytes, _database_value(record.payload["payload"])), strict=True)
+    except (ValidationError, ValueError, TypeError) as error:
+        raise BundleFormatError("recurrence payload is invalid") from error
+    expected = {
+        "scope_id": value.scope_id,
+        "task_outcome_source_type": value.task_outcome_ref.source_type,
+        "task_outcome_source_id": value.task_outcome_ref.source_id,
+        "task_outcome_position": value.task_outcome_position,
+        "signature_key": value.signature_key,
+    }
+    if isinstance(value, RecurrenceMatch):
+        ref = value.artifact_ref
+        expected.update({
+            "match_key": match_key(value),
+            "failure_item_kind": value.failure_ref.item_kind,
+            "failure_item_index": value.failure_ref.item_index,
+            "failure_item_digest": value.failure_ref.item_digest,
+            "candidate_set_mode": value.candidate_set_mode,
+            "candidate_set_digest": value.candidate_set_digest,
+            "result": value.result,
+            "target_family": None if ref is None else ref.family,
+            "target_artifact_id": None if ref is None else ref.artifact_id,
+            "target_revision": None if ref is None else ref.revision,
+        })
+    else:
+        if value.observation_id != canonical_digest(observation_identity(value)):
+            raise BundleFormatError("recurrence observation has an invalid identity")
+        expected.update({
+            "observation_id": value.observation_id,
+            "selection_key": selection_key(value),
+            "verdict_key": verdict_key(value),
+            "event": value.event,
+            "match_basis": value.match_basis,
+            "family": value.artifact_ref.family,
+            "artifact_id": value.artifact_ref.artifact_id,
+            "revision": value.artifact_ref.revision,
+            "signature_key_hash": _json_value(hashlib.sha256(value.signature_key.encode()).digest()),
+        })
+    actual = {**record.identity, **record.payload}
+    if any(type(actual[key]) is not type(field) or actual[key] != field for key, field in expected.items()):
+        raise BundleFormatError("recurrence payload does not match its indexed fields")
+    return value
 
 
 def _validate_datetime_text(value: object, /) -> None:
@@ -1407,6 +1509,32 @@ def _validate_record_dependencies(  # noqa: C901 - logical record kinds have dis
             },
         ):
             raise BundleFormatError("observation references missing or mismatched Source definition")
+    elif record.record_type in {"recurrence_match", "recurrence_observation"}:
+        value = _recurrence_value(record)
+        if not contains(
+            "source_position",
+            {
+                "scope_id": scope,
+                **value.task_outcome_ref.model_dump(),
+                "position": value.task_outcome_position,
+            },
+        ):
+            raise BundleFormatError("recurrence references missing or mismatched Source")
+        if isinstance(value, RecurrenceMatch):
+            refs = value.candidate_refs
+        else:
+            refs = (value.artifact_ref,) if value.handoff_ref is None else (value.artifact_ref, value.handoff_ref)
+            if value.handoff_receipt_ref is not None and not contains(
+                "source", {"scope_id": scope, **value.handoff_receipt_ref.model_dump()}
+            ):
+                raise BundleFormatError("recurrence references missing receipt Source")
+            if value.recurrence_match_digest is not None and not contains(
+                "recurrence_match_digest", {"scope_id": scope, "match_key": value.recurrence_match_digest}
+            ):
+                raise BundleFormatError("recurrence references missing frozen match")
+        for ref in refs:
+            if not contains("artifact_revision", {"scope_id": scope, **ref.model_dump()}):
+                raise BundleFormatError("recurrence references missing exact Artifact revision")
     elif record.record_type == "artifact_revision" and identity["family"] == "topic-memory":
         if not contains("topic_memory_publication", identity):
             raise BundleFormatError("Topic Memory revision has no publication metadata")
@@ -1673,6 +1801,28 @@ def _identity_index(source: Path, /) -> Iterator[Callable[[str, Mapping[str, obj
                 )
             except sqlite3.IntegrityError as error:
                 raise BundleFormatError("bundle contains duplicate immutable identity") from error
+            if record.record_type == "source":
+                connection.execute(
+                    "INSERT INTO identities (record_type, identity) VALUES (?, ?)",
+                    (
+                        "source_position",
+                        _identity_key({
+                            **record.identity,
+                            "position": record.payload["journal_position"],
+                        }),
+                    ),
+                )
+            if record.record_type == "recurrence_match":
+                connection.execute(
+                    "INSERT INTO identities (record_type, identity) VALUES (?, ?)",
+                    (
+                        "recurrence_match_digest",
+                        _identity_key({
+                            "scope_id": record.identity["scope_id"],
+                            "match_key": record.payload["match_key"],
+                        }),
+                    ),
+                )
             if record.record_type == "source_definition":
                 connection.execute(
                     "INSERT INTO identities (record_type, identity) VALUES (?, ?)",

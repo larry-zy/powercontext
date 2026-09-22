@@ -103,6 +103,10 @@ The archive has a versioned manifest (`format_version`, producer version, scopes
 checksum) plus NDJSON records. It is the authoritative round-trip format. CSV may be produced separately for bounded
 analysis, but it cannot preserve immutable revisions, lineage, or evidence references and must not be used for restore.
 
+Frozen recurrence matches and events are preserved with their original idempotency keys, Source positions, and exact
+Artifact revisions. Restore validates candidate revisions, Handoff/receipt references, and event-to-match dependencies.
+Advancing an Experience head does not change this history; replay after restore reuses the saved decisions.
+
 ## Recovery and conflicts
 
 Restore is idempotent. Replaying the same archive recognizes identical records as `already_present`. A different
